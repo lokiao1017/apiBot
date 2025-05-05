@@ -1304,6 +1304,7 @@ async function performCheck(username, password) { /* ... (keep existing code) ..
 
 // --- Express Application ---
 const app = express();
+app.set('json spaces', 4);
 app.set('trust proxy', 1); // Trust first proxy hop
 
 app.get('/api', async (req, res) => { /* ... (keep existing code, minor log label change) ... */
