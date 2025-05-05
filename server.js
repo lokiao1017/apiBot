@@ -1174,7 +1174,7 @@ const app = express();
 // to get the correct req.ip
 app.set('trust proxy', 1); // Adjust the number based on your proxy setup
 
-app.get('/codm', async (req, res) => {
+app.get('/api', async (req, res) => {
     // Reload keys on each request for simplicity and to reflect bot changes
     await loadApiKeys();
 
@@ -1279,7 +1279,7 @@ app.get('/codm', async (req, res) => {
 app.get('/', (req, res) => {
      res.status(200).json({
          status: "ok",
-         message: "S1N CODM Checker API is running (Node.js Version).",
+         message: "S1N CODM Checker API is running.",
          owner: OWNER_TAG
         });
 });
