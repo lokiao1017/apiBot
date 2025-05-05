@@ -1,4 +1,4 @@
-# --- Core Node.js Modules ---
+// --- Core Node.js Modules ---
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
