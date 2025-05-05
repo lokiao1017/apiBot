@@ -1330,6 +1330,7 @@ async function performCheck(username, password) {
 
 // --- Express Application ---
 const app = express();
+app.set('json spaces', 4);
 // Configure 'trust proxy' if running behind a reverse proxy (like Nginx, Heroku)
 // to get the correct req.ip
 app.set('trust proxy', 1); // Adjust the number based on your proxy setup
