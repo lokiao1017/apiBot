@@ -2,13 +2,13 @@
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-const { URL, URLSearchParams } = require('url'); // Import URLSearchParams
+const { URL, URLSearchParams } = require('url');
 
 // --- Dependencies ---
-require('dotenv').config(); // Load .env variables
+require('dotenv').config(); // Load .env variables FIRST
 const express = require('express');
 const axios = require('axios');
-const { Cookie, CookieJar } = require('tough-cookie'); // Import Cookie for manual creation
+const { Cookie, CookieJar } = require('tough-cookie');
 const { wrapper: axiosCookieJarSupport } = require('axios-cookiejar-support');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
@@ -16,26 +16,24 @@ const he = require('he'); // HTML entities
 
 // --- Configuration ---
 const LOG_DIR = "logs";
-const API_KEY_FILE = "api_keys.txt"; // API Keys managed via file and bot
-const DATADOME_DB_DIR = "db"; // Directory for database files
-const DATADOME_FILE = path.join(DATADOME_DB_DIR, "datadome.json"); // Path to datadome cookie file
-const MAX_DATADOME_COOKIES = 15; // Max number of datadome cookies to store
+const DATADOME_DB_DIR = "db"; // Directory for ALL database files
+const API_KEY_FILE = path.join(DATADOME_DB_DIR, "api_keys.txt"); // <<< CHANGED: API Keys now in db folder
+const DATADOME_FILE = path.join(DATADOME_DB_DIR, "datadome.json");
+const MAX_DATADOME_COOKIES = 15;
 
 // --- Telegram Bot Config ---
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// Ensure ADMIN_USER_ID is parsed correctly from .env (MUST be numeric ID)
 const TELEGRAM_ADMIN_USER_ID = parseInt(process.env.TELEGRAM_ADMIN_USER_ID || '0', 10);
 
 // --- Garena/CODM Constants ---
 const APK_URL = "https://auth.garena.com/api/login?";
 const REDIRECT_URL = "https://auth.codm.garena.com/auth/auth/callback_n?site=https://api-delete-request.codm.garena.co.id/oauth/callback/";
 const EXTERNAL_SCRIPT_URL = process.env.EXTERNAL_SCRIPT_URL || "https://suneoxjarell.x10.bz/jajak.php"; // External dependency
-const GARENA_AUTH_DOMAIN = "auth.garena.com"; // Domain for setting cookies
+const GARENA_AUTH_DOMAIN = "auth.garena.com";
 const GARENA_AUTH_URL = `https://${GARENA_AUTH_DOMAIN}/`;
 
 // --- Script Owner Information ---
-// Script Owner: YISHUX (S1N) - Please respect the original author.
-// TG: @YISHUX
-// Unauthorized copying, modification, or distribution is discouraged.
 const OWNER_TAG = "YISHUX (S1N)";
 const CHECKER_BY_TAG = "YISHUX - TG: @YISHUX";
 
@@ -49,15 +47,18 @@ const USER_AGENTS = [
 
 // --- Global Variables & Setup ---
 let apiKeys = new Set();
-let bot = null; // Telegram Bot instance
-let datadomeCookies = []; // In-memory store for datadome cookies
-let isSavingDatadome = false; // Mutex flag for saving datadome file
+let bot = null;
+let datadomeCookies = [];
+let isSavingDatadome = false;
+let isSavingKeys = false;
+let isloadingKeys = false;
 
 // --- Logging Setup ---
 (async () => {
     try {
+        // Ensure log AND db directories exist at startup
         await fs.mkdir(LOG_DIR, { recursive: true });
-        await fs.mkdir(DATADOME_DB_DIR, { recursive: true }); // Create DB directory if it doesn't exist
+        await fs.mkdir(DATADOME_DB_DIR, { recursive: true }); // Create DB directory
     } catch (err) {
         console.error("Error creating log or db directory:", err);
     }
@@ -81,19 +82,13 @@ const logger = winston.createLogger({
     ],
 });
 
-// Helper to get line number for logs (approximation)
-function getLineNumber() {
-    try {
-        throw new Error();
-    } catch (e) {
+function getLineNumber() { // Basic line number helper
+    try { throw new Error(); } catch (e) {
         try {
-            // Adjust the index based on call stack depth
-            const line = e.stack.split('\n')[3]; // May need adjustment
+            const line = e.stack.split('\n')[3];
             const match = line.match(/(\d+):\d+\)?$/);
             return match ? match[1] : '?';
-        } catch {
-            return '?';
-        }
+        } catch { return '?'; }
     }
 }
 const log = {
@@ -104,7 +99,7 @@ const log = {
 };
 
 // --- Utility Functions ---
-function stripAnsiCodes(text) {
+function stripAnsiCodes(text) { /* ... (keep existing code) ... */
     if (typeof text !== 'string') {
         return text;
     }
@@ -116,21 +111,17 @@ function stripAnsiCodes(text) {
     cleaned = cleaned.replace(simpleColorEscape, '');
     return cleaned;
 }
-
-function getCurrentTimestamp() {
+function getCurrentTimestamp() { /* ... (keep existing code) ... */
     return Math.floor(Date.now() / 1000).toString();
 }
-
-function generateMd5Hash(password) {
+function generateMd5Hash(password) { /* ... (keep existing code) ... */
     return crypto.createHash('md5').update(password, 'utf-8').digest('hex');
 }
-
-function generateDecryptionKey(passwordMd5, v1, v2) {
+function generateDecryptionKey(passwordMd5, v1, v2) { /* ... (keep existing code) ... */
     const intermediateHash = crypto.createHash('sha256').update(passwordMd5 + v1).digest('hex');
     return crypto.createHash('sha256').update(intermediateHash + v2).digest('hex');
 }
-
-function encryptAes256Ecb(plaintextHex, keyHex) {
+function encryptAes256Ecb(plaintextHex, keyHex) { /* ... (keep existing code) ... */
     try {
         const key = Buffer.from(keyHex, 'hex');
         if (key.length !== 32) {
@@ -151,15 +142,12 @@ function encryptAes256Ecb(plaintextHex, keyHex) {
         throw error; // Re-throw to be caught by caller
     }
 }
-
-
-function getEncryptedPassword(password, v1, v2) {
+function getEncryptedPassword(password, v1, v2) { /* ... (keep existing code) ... */
     const passwordMd5 = generateMd5Hash(password);
     const decryptionKey = generateDecryptionKey(passwordMd5, v1, v2);
     return encryptAes256Ecb(passwordMd5, decryptionKey);
 }
-
-function getRandomUserAgentData() {
+function getRandomUserAgentData() { /* ... (keep existing code) ... */
     const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
     let sec_ch_ua = "";
     let platform_name = "Windows";
@@ -186,14 +174,19 @@ function getRandomUserAgentData() {
 
     return { userAgent: ua, secChUa: sec_ch_ua, platformName: platform_name };
 }
-
-function detectCaptchaInResponse(responseText) {
+function detectCaptchaInResponse(responseText) { /* ... (keep existing code) ... */
     return typeof responseText === 'string' && responseText.toLowerCase().includes("captcha");
 }
+// Escape text for Telegram MarkdownV2
+function escapeTgMarkdownV2(text) {
+    if (typeof text !== 'string') return text;
+    // Escape characters according to Telegram API documentation
+    return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
 
 // --- Datadome Cookie Management ---
-
-async function loadDatadomeCookies() {
+async function loadDatadomeCookies() { /* ... (keep existing code) ... */
     log.debug("Attempting to load Datadome cookies...", "loadDatadomeCookies");
     try {
         // Check if file exists
@@ -223,8 +216,7 @@ async function loadDatadomeCookies() {
         }
     }
 }
-
-async function persistDatadomeCookies() {
+async function persistDatadomeCookies() { /* ... (keep existing code) ... */
     if (isSavingDatadome) {
         log.warn("Datadome save already in progress, skipping.", "persistDatadomeCookies");
         return false;
@@ -245,8 +237,7 @@ async function persistDatadomeCookies() {
         isSavingDatadome = false;
     }
 }
-
-async function saveDatadomeCookie(cookieValue) {
+async function saveDatadomeCookie(cookieValue) { /* ... (keep existing code) ... */
     if (!cookieValue || typeof cookieValue !== 'string') {
         log.warn("Attempted to save invalid Datadome cookie.", "saveDatadomeCookie");
         return;
@@ -263,8 +254,7 @@ async function saveDatadomeCookie(cookieValue) {
         log.debug("Datadome cookie already exists in store, not saving again.", "saveDatadomeCookie");
     }
 }
-
-function getRandomDatadomeCookie() {
+function getRandomDatadomeCookie() { /* ... (keep existing code) ... */
     if (datadomeCookies.length === 0) {
         return null;
     }
@@ -274,21 +264,18 @@ function getRandomDatadomeCookie() {
     return cookieValue;
 }
 
-// --- API Key Management ---
-// Using a simple mutex-like flag for file operations to avoid race conditions
-let isSavingKeys = false;
-let isloadingKeys = false;
 
+// --- API Key Management ---
 async function loadApiKeys() {
     if (isloadingKeys) {
         log.warn("Load API keys already in progress, skipping.", "loadApiKeys");
         return;
     }
     isloadingKeys = true;
-    log.debug("Attempting to load API keys...", "loadApiKeys");
+    log.debug(`Attempting to load API keys from ${API_KEY_FILE}...`, "loadApiKeys"); // Log full path
     try {
-        // Ensure parent directory exists
-        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true });
+        // Ensure parent directory (db) exists
+        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true }); // <<< Path now includes 'db'
         if (!await fs.access(API_KEY_FILE).then(() => true).catch(() => false)) {
             log.warn(`${API_KEY_FILE} not found. Creating empty file.`, "loadApiKeys");
             await fs.writeFile(API_KEY_FILE, '', 'utf-8');
@@ -312,10 +299,10 @@ async function saveApiKeys() {
         return false;
     }
     isSavingKeys = true;
-    log.debug(`Attempting to save ${apiKeys.size} keys...`, "saveApiKeys");
+    log.debug(`Attempting to save ${apiKeys.size} keys to ${API_KEY_FILE}...`, "saveApiKeys"); // Log full path
     try {
-         // Ensure parent directory exists
-        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true });
+         // Ensure parent directory (db) exists
+        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true }); // <<< Path now includes 'db'
         const header = `# API Keys for CODM Checker - Managed by Telegram Bot\n# Owner: ${OWNER_TAG}\n`;
         const data = header + Array.from(apiKeys).sort().join('\n') + '\n';
         await fs.writeFile(API_KEY_FILE, data, 'utf-8');
@@ -329,10 +316,12 @@ async function saveApiKeys() {
     }
 }
 
-// --- Core Checking Logic ---
 
-function getRequestData() {
-    // Creates fresh headers for each request sequence
+// --- Core Checking Logic ---
+// (getRequestData, getDatadomeCookie, showLevel, checkLogin, formatResultDict, performCheck)
+// --- No changes needed in the core checking logic functions themselves ---
+// --- Keep the existing code for these functions ---
+function getRequestData() { /* ... (keep existing code) ... */
     const { userAgent, secChUa, platformName } = getRandomUserAgentData();
     log.debug(`Using UA: ${userAgent}, Platform: ${platformName}`, 'getRequestData');
 
@@ -353,8 +342,7 @@ function getRequestData() {
     };
     return headers; // Only headers needed now, cookies handled by jar
 }
-
-async function getDatadomeCookie(axiosInstance, proxies = null) {
+async function getDatadomeCookie(axiosInstance, proxies = null) { /* ... (keep existing code) ... */
     const url = 'https://dd.garena.com/js/';
     const { userAgent, secChUa, platformName } = getRandomUserAgentData();
     const headers = {
@@ -427,8 +415,7 @@ async function getDatadomeCookie(axiosInstance, proxies = null) {
         return `[API_ERROR] Datadome Request Error: ${errorStr.slice(0, 100)}`;
     }
 }
-
-async function showLevel(accessToken, baseHeaders, axiosInstance, proxies = null) {
+async function showLevel(accessToken, baseHeaders, axiosInstance, proxies = null) { /* ... (keep existing code) ... */
     const callbackBaseUrl = "https://auth.codm.garena.com/auth/auth/callback_n";
     const callbackParams = {
         site: "https://api-delete-request.codm.garena.co.id/oauth/callback/",
@@ -630,9 +617,7 @@ async function showLevel(accessToken, baseHeaders, axiosInstance, proxies = null
         return `[CODM_FAIL] Unexpected error during callback: ${errorStr.slice(0, 100)}`;
     }
 }
-
-
-async function checkLogin(accountUsername, _id, encryptedPassword, password, baseHeaders, axiosInstance, date, proxies = null) {
+async function checkLogin(accountUsername, _id, encryptedPassword, password, baseHeaders, axiosInstance, date, proxies = null) { /* ... (keep existing code) ... */
     log.debug(`Starting check_login for ${accountUsername}`, 'checkLogin');
 
     // Datadome cookie should be handled by the axiosInstance's cookie jar if set previously
@@ -1078,14 +1063,7 @@ async function checkLogin(accountUsername, _id, encryptedPassword, password, bas
     log.info(`Full check successful for ${accountUsername}. Level: ${codmLevelStr}`, 'checkLogin');
     return resultDict; // Return the success dictionary
 }
-
-// Function to format the final successful result into a JSON-friendly object
-function formatResultDict(
-    lastLogin, lastLoginWhere, country, shellStr, avatarUrl, mobile,
-    facebookBoundStr, emailVerifiedStr, authenticatorEnabledStr, twoStepEnabledStr,
-    connectedGamesData, fbName, fbLink, email, date,
-    username, password, /* OMITTED password */ ckzCount, lastLoginIp, accountStatus
-) {
+function formatResultDict( lastLogin, lastLoginWhere, country, shellStr, avatarUrl, mobile, facebookBoundStr, emailVerifiedStr, authenticatorEnabledStr, twoStepEnabledStr, connectedGamesData, fbName, fbLink, email, date, username, password, /* OMITTED password */ ckzCount, lastLoginIp, accountStatus ) { /* ... (keep existing code) ... */
     let codmInfoJson = { status: "Not Linked or Check Failed", level: null };
     if (connectedGamesData && connectedGamesData.length > 0) {
         const gameData = connectedGamesData[0]; // Assume only CODM
@@ -1159,9 +1137,7 @@ function formatResultDict(
 
     return resultData;
 }
-
-
-async function performCheck(username, password) {
+async function performCheck(username, password) { /* ... (keep existing code) ... */
     log.debug(`Starting perform_check for ${username}`, 'performCheck');
     const date = getCurrentTimestamp();
     const randomId = String(Math.floor(Math.random() * 900000000000) + 100000000000); // 12 digit random ID
@@ -1324,122 +1300,104 @@ async function performCheck(username, password) {
     // --- End Save Datadome ---
 
     return loginResult; // Return the dict or error string from check_login
-
 }
-
 
 // --- Express Application ---
 const app = express();
-app.set('json spaces', 4);
-// Configure 'trust proxy' if running behind a reverse proxy (like Nginx, Heroku)
-// to get the correct req.ip
-app.set('trust proxy', 1); // Adjust the number based on your proxy setup
+app.set('trust proxy', 1); // Trust first proxy hop
 
-app.get('/api', async (req, res) => {
-    // Reload keys on each request for simplicity and to reflect bot changes
+app.get('/api', async (req, res) => { /* ... (keep existing code, minor log label change) ... */
     await loadApiKeys();
-    // Note: Datadome cookies are loaded at startup and managed in memory/saved on success.
-    // No need to reload them per-request unless memory usage becomes an issue.
 
     const { apikey, username, password } = req.query;
     const clientIp = req.ip;
 
-    log.info(`Request received from ${clientIp}: user=${username || 'N/A'}, key_provided=${apikey ? 'Yes' : 'No'}`, '/api'); // Changed endpoint log label
+    log.info(`Request received from ${clientIp}: user=${username || 'N/A'}, key_provided=${apikey ? 'Yes' : 'No'}`, 'API:/api'); // More specific label
 
-    // Validate API Key
     if (!apikey || !apiKeys.has(apikey)) {
-        log.warn(`Invalid API key attempt from ${clientIp}. Key: ${apikey || 'None'}`, '/api');
+        log.warn(`Invalid API key attempt from ${clientIp}. Key: ${apikey || 'None'}`, 'API:/api');
         return res.status(401).json({ status: "error", owner: OWNER_TAG, message: "Invalid or missing API key" });
     }
 
-    // Validate Input Parameters
     if (!username || !password) {
-        log.warn(`Missing username or password from ${clientIp} (Key: ${apikey})`, '/api');
+        log.warn(`Missing username or password from ${clientIp} (Key: ${apikey})`, 'API:/api');
         return res.status(400).json({ status: "error", owner: OWNER_TAG, message: "Missing username or password parameter" });
     }
 
-    // Perform the actual check
     try {
         const result = await performCheck(username, password);
 
         if (typeof result === 'object' && result !== null && !result.error) {
-            // --- Successful check ---
-            log.info(`Check successful for ${username} (Key: ${apikey}). Level: ${result?.codm_details?.level ?? 'N/A'}`, '/api');
+            log.info(`Check successful for ${username} (Key: ${apikey}). Level: ${result?.codm_details?.level ?? 'N/A'}`, 'API:/api');
 
             // --- FORWARD SUCCESS TO TELEGRAM ADMIN (Non-blocking) ---
             if (bot && TELEGRAM_ADMIN_USER_ID) {
-                // Escape username for MarkdownV2 (simple backticks are usually safe)
-                const escapedUsername = `\`${username.replace(/`/g, "'")}\``; // Basic protection
+                const escapedUsername = `\`${username.replace(/`/g, "'")}\``; // Basic escape for inline code
                 const codmNick = result?.codm_details?.nickname;
                 const codmLevel = result?.codm_details?.level;
-                let codmInfoStr = "N/A";
-                if (codmNick && codmLevel) {
-                    // Escape nick for MarkdownV2 (more complex chars might need full escaping)
-                    const escapedNick = he.encode(codmNick).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+                let codmInfoStr = escapeTgMarkdownV2("N/A");
+                if (codmNick && codmLevel !== null) {
+                    const escapedNick = escapeTgMarkdownV2(codmNick);
                     codmInfoStr = `${escapedNick} \\(Lvl ${codmLevel}\\)`;
                 } else if (codmNick) {
-                     const escapedNick = he.encode(codmNick).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-                     codmInfoStr = `${escapedNick} (Lvl N/A)`;
+                     const escapedNick = escapeTgMarkdownV2(codmNick);
+                     codmInfoStr = `${escapedNick} \\(Lvl N/A\\)`;
                 } else if (result?.codm_details?.status === 'Linked') {
-                    codmInfoStr = "Linked (Details N/A)";
+                    codmInfoStr = escapeTgMarkdownV2("Linked (Details N/A)");
                 }
 
                 const successMsg = `✅ Check success for user: ${escapedUsername}\nCODM: ${codmInfoStr}`;
 
                 bot.sendMessage(TELEGRAM_ADMIN_USER_ID, successMsg, { parse_mode: 'MarkdownV2' })
                     .catch(err => {
-                        log.warn(`Failed to forward success message to admin ${TELEGRAM_ADMIN_USER_ID}: ${err.message || err}`, '/api');
+                        log.warn(`Failed to forward success message to admin ${TELEGRAM_ADMIN_USER_ID}: ${err.message || err}`, 'API:/api');
                     });
             } else {
-                if (!bot) log.warn("Telegram bot instance not available for forwarding success.", '/api');
-                if (!TELEGRAM_ADMIN_USER_ID) log.warn("Telegram Admin User ID not configured for forwarding success.", '/api');
+                if (!bot) log.warn("Telegram bot instance not available for forwarding success.", 'API:/api');
+                if (!TELEGRAM_ADMIN_USER_ID) log.warn("Telegram Admin User ID not configured for forwarding success.", 'API:/api');
             }
             // --- END TELEGRAM FORWARD ---
 
             return res.status(200).json({ status: "success", owner: OWNER_TAG, data: result });
 
         } else if (typeof result === 'string') {
-            // Handle known error strings
-            log.warn(`Check failed for ${username} (Key: ${apikey}): ${result}`, '/api');
-            let status_code = 500; // Default internal error
+            log.warn(`Check failed for ${username} (Key: ${apikey}): ${result}`, 'API:/api');
+            let status_code = 500;
             let message = "Check failed";
             let detail = result;
 
-             // Extract detail cleanly
-            if (result.includes("]")) {
+             if (result.includes("]")) {
                  detail = result.split("]", 1)[1]?.trim() || result;
-            }
+             }
 
             if (result.startsWith("[API_ERROR]")) {
                 message = "Checker API error";
-                if (result.includes("CAPTCHA")) status_code = 429; // Too Many Requests / CAPTCHA
-                else if (result.includes("Timeout")) status_code = 504; // Gateway Timeout
+                if (result.includes("CAPTCHA")) status_code = 429;
+                else if (result.includes("Timeout")) status_code = 504;
                 else if (result.includes("RateLimit")) status_code = 429;
-                else if (result.includes("Connection")) status_code = 503; // Service Unavailable
-                else status_code = 500; // Internal Server Error / Dependency Issue
+                else if (result.includes("Connection")) status_code = 503;
+                else status_code = 500;
             } else if (result.startsWith("[LOGIN_FAIL]")) {
                 message = "Login failed";
-                status_code = 403; // Forbidden (Invalid Credentials / Account Issue)
+                status_code = 403;
             } else if (result.startsWith("[CODM_FAIL]") || result.startsWith("[CODM_WARN]")) {
-                message = "CODM check failed post-login";
-                 if (result.startsWith("[CODM_WARN]")) message = "CODM check warning";
-                status_code = 502; // Bad Gateway (Issue with CODM check/script after login)
+                message = result.startsWith("[CODM_WARN]") ? "CODM check warning" : "CODM check failed post-login";
+                status_code = 502;
             }
 
             return res.status(status_code).json({ status: "error", owner: OWNER_TAG, message: message, detail: detail });
         } else {
-            // Unexpected result type
-            log.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`, '/api');
+            log.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`, 'API:/api');
             return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error (unexpected result type)" });
         }
 
     } catch (error) {
-        log.error(`Critical error processing request for ${username} (Key: ${apikey}): ${error.stack || error}`, '/api');
+        log.error(`Critical error processing request for ${username} (Key: ${apikey}): ${error.stack || error}`, 'API:/api');
         return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error", detail: stripAnsiCodes(String(error)) });
     }
 });
 
-app.get('/', (req, res) => {
+app.get('/', (req, res) => { /* ... (keep existing code) ... */
      res.status(200).json({
          status: "ok",
          message: "S1N CODM Checker API is running.",
@@ -1448,72 +1406,127 @@ app.get('/', (req, res) => {
         });
 });
 
-// --- Telegram Bot Functions ---
+// --- Telegram Bot Functions (Improved) ---
+
+// Helper to safely send messages, handling Markdown errors
+async function sendTelegramMessage(chatId, text, options = {}) {
+    if (!bot) {
+        log.warn("Attempted to send Telegram message, but bot is not initialized.", "sendTelegramMessage");
+        return;
+    }
+    try {
+        await bot.sendMessage(chatId, text, { parse_mode: "MarkdownV2", ...options });
+    } catch (error) {
+        log.error(`Failed to send Telegram message to ${chatId}: ${error}`, "sendTelegramMessage");
+        // Fallback to plain text if Markdown fails
+        if (error.message.includes("parse error")) {
+             log.warn(`MarkdownV2 failed, sending plain text fallback to ${chatId}`, "sendTelegramMessage");
+             try {
+                 await bot.sendMessage(chatId, text, { ...options, parse_mode: undefined }); // Remove parse_mode
+             } catch (fallbackError) {
+                 log.error(`Failed to send plain text fallback message to ${chatId}: ${fallbackError}`, "sendTelegramMessage");
+             }
+        }
+    }
+}
+
 
 function setupTelegramBot() {
-    if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN" || !TELEGRAM_ADMIN_USER_ID) {
-        log.warn("Telegram Bot Token or Admin User ID not set correctly in .env. Bot will not run.", 'TelegramBot');
+    if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN") {
+        log.warn("Telegram Bot Token not set correctly in .env. Bot will not run.", 'TelegramBotSetup');
         return null;
+    }
+    if (!TELEGRAM_ADMIN_USER_ID || TELEGRAM_ADMIN_USER_ID === 0) {
+         log.warn("Telegram Admin User ID not set or invalid in .env (must be numeric). Bot commands will not be authorized.", 'TelegramBotSetup');
+         // Allow bot to start for API forwarding, but admin commands won't work.
     }
 
     try {
         bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-        log.info("Telegram bot initialized and polling.", 'TelegramBot');
+        log.info("Telegram bot initialized and polling.", 'TelegramBotSetup');
 
         // --- Authorization Middleware ---
         const authorized = (msg, reply = true) => {
             const userId = msg.from?.id;
-            if (userId !== TELEGRAM_ADMIN_USER_ID) {
-                if (reply) bot.sendMessage(msg.chat.id, "⛔ You are not authorized to use this command.");
-                log.warn(`Unauthorized Telegram access attempt by user ${userId} (${msg.from?.username || 'N/A'})`, 'TelegramBot');
+            // Log the check attempt
+            log.debug(`Authorization check: UserID=${userId}, Username=${msg.from?.username || 'N/A'}, RequiredAdminID=${TELEGRAM_ADMIN_USER_ID}`, 'TelegramBotAuth');
+
+            if (!TELEGRAM_ADMIN_USER_ID || TELEGRAM_ADMIN_USER_ID === 0) {
+                if (reply) sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("⛔ Admin User ID not configured. Cannot authorize."));
+                log.warn("Authorization denied: Admin ID not configured.", 'TelegramBotAuth');
                 return false;
             }
+
+            if (userId !== TELEGRAM_ADMIN_USER_ID) {
+                if (reply) sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("⛔ You are not authorized to use this command."));
+                log.warn(`Unauthorized Telegram access attempt by user ${userId} (${msg.from?.username || 'N/A'})`, 'TelegramBotAuth');
+                return false;
+            }
+            log.debug(`Authorization successful for UserID=${userId}`, 'TelegramBotAuth');
             return true;
         };
 
         // --- Command Handlers ---
         bot.onText(/\/start$/, (msg) => {
             if (!authorized(msg)) return;
-            bot.sendMessage(msg.chat.id,
-                `👋 Hello Admin\\! \\(${OWNER_TAG}\\)\n\n` + // Escaped ! and added owner
-                `Use /addkey \`<key>\` to add an API key\\.\n` +
-                `Use /removekey \`<key>\` to remove an API key\\.\n` +
-                `Use /listkeys to view current keys\\.\n`+
-                `Use /reloadkeys to force reload from file\\.\n\n`+
+            const startMsg =
+                `👋 Hello Admin\\! \\(${escapeTgMarkdownV2(OWNER_TAG)}\\)\n\n` +
+                `*API Key Management:*\n` +
+                ` /addkey \`<key>\` \\- Add an API key\n` +
+                ` /removekey \`<key>\` \\- Remove an API key\n` +
+                ` /listkeys \\- View current keys\n`+
+                ` /reloadkeys \\- Force reload from file\n\n`+
                 `*Datadome Management:*\n`+
-                ` /listdatadome \\- View saved Datadome cookies \\(first/last 5\\)\n` +
-                ` /cleardatadome \\- Clear all saved Datadome cookies`,
-                 { parse_mode: "MarkdownV2" }
-            );
+                ` /listdatadome \\- View saved Datadome cookies\n` +
+                ` /cleardatadome \\- Clear all saved Datadome cookies\n\n` +
+                `*Utility:*\n` +
+                ` /whoami \\- Check your User ID and authorization status`;
+
+            sendTelegramMessage(msg.chat.id, startMsg);
         });
+
+        // NEW: /whoami command for debugging authorization
+        bot.onText(/\/whoami$/, (msg) => {
+            const userId = msg.from?.id;
+            const username = msg.from?.username || 'N/A';
+            const isAdmin = (userId === TELEGRAM_ADMIN_USER_ID && TELEGRAM_ADMIN_USER_ID !== 0);
+
+            const infoMsg = `Your Telegram Info:\n` +
+                            `User ID: \`${userId}\`\n` +
+                            `Username: \`${escapeTgMarkdownV2(username)}\`\n` +
+                            `Authorized Admin: ${isAdmin ? '✅ Yes' : '❌ No'}\n` +
+                            `Configured Admin ID: \`${TELEGRAM_ADMIN_USER_ID || 'Not Set'}\``;
+
+             sendTelegramMessage(msg.chat.id, infoMsg);
+             log.info(`/whoami command executed by UserID=${userId}, Username=${username}. IsAdmin=${isAdmin}`, 'TelegramBot:/whoami');
+        });
+
 
         bot.onText(/\/addkey (.+)/, async (msg, match) => {
             if (!authorized(msg)) return;
             const newKey = match[1].trim();
             if (!newKey) {
-                bot.sendMessage(msg.chat.id, "⚠️ API key cannot be empty.");
+                sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("⚠️ API key cannot be empty."));
                 return;
             }
             if (/\s/.test(newKey)) {
-                 bot.sendMessage(msg.chat.id, "⚠️ API key cannot contain spaces.");
+                 sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("⚠️ API key cannot contain spaces."));
                  return;
              }
 
-            await loadApiKeys(); // Ensure latest keys are loaded
+            await loadApiKeys();
+            const escapedKey = escapeTgMarkdownV2(newKey);
             if (apiKeys.has(newKey)) {
-                // Escape key for MarkdownV2 before sending
-                 const escapedKey = he.encode(newKey).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-                bot.sendMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` already exists\\.`, { parse_mode: "MarkdownV2" });
+                sendTelegramMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` already exists\\.`, { parse_mode: "MarkdownV2" }); // Use parse_mode here too for consistency
             } else {
-                apiKeys.add(newKey); // Add to the set in memory
-                const saved = await saveApiKeys(); // Attempt to save to file
+                apiKeys.add(newKey);
+                const saved = await saveApiKeys();
                 if (saved) {
-                     const escapedKey = he.encode(newKey).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-                    bot.sendMessage(msg.chat.id, `✅ API key \`${escapedKey}\` added successfully\\.`, { parse_mode: "MarkdownV2" });
-                    log.info(`API key '${newKey}' added by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+                    sendTelegramMessage(msg.chat.id, `✅ API key \`${escapedKey}\` added successfully\\.`, { parse_mode: "MarkdownV2" });
+                    log.info(`API key added by admin ${msg.from.id} via Telegram: '${newKey}'`, 'TelegramBot:/addkey');
                 } else {
-                    apiKeys.delete(newKey); // Rollback memory change if save failed
-                    bot.sendMessage(msg.chat.id, "❌ Failed to save API keys to file. Check logs. Key not added.");
+                    apiKeys.delete(newKey); // Rollback
+                    sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("❌ Failed to save API keys to file. Check logs. Key not added."));
                 }
             }
         });
@@ -1521,57 +1534,53 @@ function setupTelegramBot() {
         bot.onText(/\/removekey (.+)/, async (msg, match) => {
             if (!authorized(msg)) return;
             const keyToRemove = match[1].trim();
+            await loadApiKeys();
+            const escapedKey = escapeTgMarkdownV2(keyToRemove);
 
-            await loadApiKeys(); // Ensure latest keys are loaded
             if (!apiKeys.has(keyToRemove)) {
-                const escapedKey = he.encode(keyToRemove).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-                bot.sendMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` not found\\.`, { parse_mode: "MarkdownV2" });
+                sendTelegramMessage(msg.chat.id, `ℹ️ API key \`${escapedKey}\` not found\\.`, { parse_mode: "MarkdownV2" });
             } else {
-                apiKeys.delete(keyToRemove); // Remove from memory
-                const saved = await saveApiKeys(); // Attempt save
+                apiKeys.delete(keyToRemove);
+                const saved = await saveApiKeys();
                 if (saved) {
-                    const escapedKey = he.encode(keyToRemove).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-                    bot.sendMessage(msg.chat.id, `✅ API key \`${escapedKey}\` removed successfully\\.`, { parse_mode: "MarkdownV2" });
-                    log.info(`API key '${keyToRemove}' removed by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+                    sendTelegramMessage(msg.chat.id, `✅ API key \`${escapedKey}\` removed successfully\\.`, { parse_mode: "MarkdownV2" });
+                    log.info(`API key removed by admin ${msg.from.id} via Telegram: '${keyToRemove}'`, 'TelegramBot:/removekey');
                 } else {
-                    apiKeys.add(keyToRemove); // Rollback memory change if save failed
-                    bot.sendMessage(msg.chat.id, "❌ Failed to save API keys to file. Check logs. Key not removed.");
+                    apiKeys.add(keyToRemove); // Rollback
+                    sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("❌ Failed to save API keys to file. Check logs. Key not removed."));
                 }
             }
         });
 
         bot.onText(/\/listkeys$/, async (msg) => {
             if (!authorized(msg)) return;
-            await loadApiKeys(); // Ensure latest keys
+            await loadApiKeys();
             if (apiKeys.size === 0) {
-                bot.sendMessage(msg.chat.id, "ℹ️ No API keys found.");
+                sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("ℹ️ No API keys found."));
             } else {
-                // Escape keys for MarkdownV2
                  const keysList = Array.from(apiKeys).sort().map(key =>
-                     "`" + he.encode(key).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&') + "`" // Escape MarkdownV2 special chars
+                     "`" + escapeTgMarkdownV2(key) + "`" // Escape and wrap in backticks
                  ).join("\n");
-                bot.sendMessage(msg.chat.id, `🔑 Current API Keys (${apiKeys.size}):\n${keysList}`, { parse_mode: 'MarkdownV2' });
+                sendTelegramMessage(msg.chat.id, `🔑 Current API Keys (${apiKeys.size}):\n${keysList}`, { parse_mode: 'MarkdownV2' });
             }
         });
 
          bot.onText(/\/reloadkeys$/, async (msg) => {
              if (!authorized(msg)) return;
              await loadApiKeys();
-             bot.sendMessage(msg.chat.id, `✅ Reloaded ${apiKeys.size} keys from file\\.`, { parse_mode: 'MarkdownV2' });
+             sendTelegramMessage(msg.chat.id, `✅ Reloaded ${apiKeys.size} keys from file \\(${escapeTgMarkdownV2(path.basename(API_KEY_FILE))}\\)\\.`, { parse_mode: 'MarkdownV2' });
          });
 
          // --- Datadome Bot Commands ---
-         bot.onText(/\/listdatadome$/, async (msg) => {
+         bot.onText(/\/listdatadome$/, async (msg) => { /* ... (keep existing code, use sendTelegramMessage) ... */
             if (!authorized(msg)) return;
-            // No need to reload datadome, using in-memory copy
             if (datadomeCookies.length === 0) {
-                bot.sendMessage(msg.chat.id, "ℹ️ No Datadome cookies currently stored.");
+                sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("ℹ️ No Datadome cookies currently stored."));
             } else {
                 let listMsg = `🍪 Stored Datadome Cookies (${datadomeCookies.length} total, max ${MAX_DATADOME_COOKIES}):\n`;
-                 // Show first 5 and last 5 for brevity if list is long
                 const maxToShow = 5;
                 const cookiesToShow = [];
-                if (datadomeCookies.length <= maxToShow * 2) {
+                if (datadomeCookies.length <= maxToShow * 2 + 1) { // Show all if not much longer than 2*max + ellipsis
                      cookiesToShow.push(...datadomeCookies);
                 } else {
                     cookiesToShow.push(...datadomeCookies.slice(0, maxToShow)); // First 5
@@ -1580,58 +1589,63 @@ function setupTelegramBot() {
                 }
 
                 listMsg += cookiesToShow.map((cookie, index) => {
-                    const displayIndex = (cookie === "...") ? "..." : (index < maxToShow ? index : datadomeCookies.length - (cookiesToShow.length - index));
-                    const truncatedCookie = (cookie === "...") ? "..." : `${cookie.substring(0, 15)}...${cookie.substring(cookie.length - 15)}`;
-                    // Escape for MarkdownV2 - simple backticks
-                    const escapedCookie = `\`${truncatedCookie.replace(/`/g, "'")}\``;
-                    return `${displayIndex}: ${escapedCookie}`;
+                    if (cookie === "...") return escapeTgMarkdownV2("...");
+
+                    // Determine original index if needed (slightly complex due to ellipsis)
+                    let originalIndex = index;
+                    if (cookiesToShow.includes("...") && index > maxToShow) {
+                         originalIndex = datadomeCookies.length - (cookiesToShow.length - index);
+                    }
+
+                    const truncatedCookie = `${cookie.substring(0, 15)}...${cookie.substring(cookie.length - 15)}`;
+                    // Escape for MarkdownV2 - simple backticks are okay here
+                    const escapedCookie = `\`${truncatedCookie.replace(/`/g, "'")}\``; // Replace backticks within
+                    return `${originalIndex}: ${escapedCookie}`;
                 }).join('\n');
 
-                bot.sendMessage(msg.chat.id, listMsg, { parse_mode: 'MarkdownV2' });
+                sendTelegramMessage(msg.chat.id, listMsg, { parse_mode: 'MarkdownV2' });
             }
          });
 
-         bot.onText(/\/cleardatadome$/, async (msg) => {
+         bot.onText(/\/cleardatadome$/, async (msg) => { /* ... (keep existing code, use sendTelegramMessage) ... */
              if (!authorized(msg)) return;
              const countBefore = datadomeCookies.length;
-             datadomeCookies = []; // Clear in-memory
-             const saved = await persistDatadomeCookies(); // Save empty array to file
+             datadomeCookies = [];
+             const saved = await persistDatadomeCookies();
              if (saved) {
-                 bot.sendMessage(msg.chat.id, `✅ Cleared ${countBefore} Datadome cookies successfully\\.`, { parse_mode: 'MarkdownV2' });
-                 log.info(`Datadome cookies cleared by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+                 sendTelegramMessage(msg.chat.id, `✅ Cleared ${countBefore} Datadome cookies successfully\\.`, { parse_mode: 'MarkdownV2' });
+                 log.info(`Datadome cookies cleared by admin ${msg.from.id} via Telegram.`, 'TelegramBot:/cleardatadome');
              } else {
-                 // Attempt to reload previous state? Or just report failure.
-                 await loadDatadomeCookies(); // Try reloading what was last saved (might be empty already)
-                 bot.sendMessage(msg.chat.id, "❌ Failed to save cleared Datadome cookies to file. Check logs. In-memory list might be cleared, attempting reload.", { parse_mode: 'MarkdownV2' });
+                 await loadDatadomeCookies();
+                 sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("❌ Failed to save cleared Datadome cookies to file. Check logs. In-memory list might be cleared, attempting reload."), { parse_mode: 'MarkdownV2' });
              }
          });
 
         // Optional: Catch-all for unknown commands for the admin
         bot.on('message', (msg) => {
-            // Ignore if it's a known command or not from admin
-             const knownCommands = ['/start', '/addkey', '/removekey', '/listkeys', '/reloadkeys', '/listdatadome', '/cleardatadome'];
+            const knownCommands = ['/start', '/addkey', '/removekey', '/listkeys', '/reloadkeys', '/listdatadome', '/cleardatadome', '/whoami'];
             if (msg.text && msg.text.startsWith('/') && !knownCommands.some(cmd => msg.text.startsWith(cmd))) {
-                if (authorized(msg, false)) { // Authorize but don't send the default "not authorized" reply
-                     bot.sendMessage(msg.chat.id, "❓ Sorry, I didn't understand that command\\. Use /start to see available commands\\.", { parse_mode: 'MarkdownV2' });
+                if (authorized(msg, false)) { // Authorize but don't send default reply
+                     sendTelegramMessage(msg.chat.id, escapeTgMarkdownV2("❓ Sorry, I didn't understand that command. Use /start to see available commands."));
                 }
+                // If not authorized, the `authorized` call already logged it.
             }
         });
 
         // Error handling for the bot itself
         bot.on('polling_error', (error) => {
-            log.error(`Telegram Polling Error: ${error.code} - ${error.message}`, 'TelegramBot');
-            // Optionally, try to restart polling after a delay, or notify admin if possible
-            // Be careful not to create an error loop
+            log.error(`Telegram Polling Error: ${error.code} - ${error.message}`, 'TelegramBotError');
+            // Consider adding a mechanism to notify admin via other means if polling fails repeatedly
         });
         bot.on('webhook_error', (error) => {
-             log.error(`Telegram Webhook Error: ${error.code} - ${error.message}`, 'TelegramBot');
+             log.error(`Telegram Webhook Error: ${error.code} - ${error.message}`, 'TelegramBotError');
          });
 
         return bot;
 
     } catch (error) {
-        log.error(`Failed to initialize Telegram bot: ${error}`, 'TelegramBot');
-        return null;
+        log.error(`Failed to initialize Telegram bot: ${error}`, 'TelegramBotSetup');
+        return null; // Return null explicitly
     }
 }
 
@@ -1640,53 +1654,91 @@ function setupTelegramBot() {
 (async () => {
     log.info(`--- API Checker Script Started (PID: ${process.pid}) ---`);
     log.info(`--- Owner: ${OWNER_TAG} ---`);
-    // Initial load of persistent data
-    await loadApiKeys();
-    await loadDatadomeCookies(); // Load saved datadome cookies
 
-    // Start Telegram bot
-    setupTelegramBot(); // Starts polling internally if configured
+    // CRITICAL: Check .env variables needed for bot functionality early
+    if (!process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN") {
+        log.error("FATAL: TELEGRAM_BOT_TOKEN is not set or is the placeholder value in .env file. Exiting.");
+        process.exit(1);
+    }
+     if (!process.env.TELEGRAM_ADMIN_USER_ID || !/^\d+$/.test(process.env.TELEGRAM_ADMIN_USER_ID)) {
+        log.warn("WARNING: TELEGRAM_ADMIN_USER_ID is not set or is not a valid number in .env file. Bot commands will not work for admin.");
+        // Don't exit, maybe API forwarding is still desired.
+    } else {
+         log.info(`Configured Telegram Admin User ID: ${TELEGRAM_ADMIN_USER_ID}`);
+    }
+
+
+    // Initial load of persistent data
+    await loadApiKeys(); // Now loads from db/api_keys.txt
+    await loadDatadomeCookies();
+
+    // Start Telegram bot (will log warnings if config is bad)
+    setupTelegramBot();
 
     // Start Express app
-    const host = process.env.HOST || '0.0.0.0'; // Use HOST env var if set, otherwise default
-    const port = parseInt(process.env.PORT || '5000', 10); // Use PORT env var if set, otherwise default
+    const host = process.env.HOST || '0.0.0.0'; // Listen on all interfaces by default, configurable via HOST env var
+    const port = parseInt(process.env.PORT || '5000', 10);
+
+    if (isNaN(port) || port <= 0 || port > 65535) {
+        log.error(`Invalid PORT specified: ${process.env.PORT}. Using default 5000.`);
+        port = 5000;
+    }
+
 
     app.listen(port, host, () => {
         log.info(`Express application listening on http://${host}:${port}`);
+        log.info(`Datadome file: ${DATADOME_FILE}`);
+        log.info(`API Key file: ${API_KEY_FILE}`); // <<< Log the correct path
         log.info(`Datadome cookies loaded: ${datadomeCookies.length}`);
         log.info(`API Keys loaded: ${apiKeys.size}`);
-        log.info(`NOTE: Datadome file (${DATADOME_FILE}) is saved locally. Syncing to GitHub requires external setup.`);
+        log.info(`To run 24/7 reliably, deploy this on a server/platform and use a process manager like PM2.`);
+    }).on('error', (err) => {
+         // Handle server startup errors (like port already in use)
+         log.error(`Express server error: ${err.message}`);
+         process.exit(1);
     });
 
 })();
 
-// Graceful shutdown handler
-async function gracefulShutdown(signal) {
+// --- Graceful Shutdown ---
+async function gracefulShutdown(signal) { /* ... (keep existing code) ... */
     log.info(`${signal} received. Shutting down gracefully...`);
-    // Ensure pending datadome cookies are saved
-    await persistDatadomeCookies();
-    // Add any other cleanup tasks here (e.g., closing DB connections)
+    await persistDatadomeCookies(); // Save datadome first
+    await saveApiKeys(); // Also ensure keys are saved on shutdown if modified
+
     if (bot) {
         log.info("Stopping Telegram bot polling...");
-        // Add a timeout to stopPolling in case it hangs
         const stopPollingTimeout = setTimeout(() => {
             log.warn("Telegram bot stopPolling timed out. Forcing exit.");
-            process.exit(1); // Exit with error code if timeout
-        }, 5000); // 5 second timeout
+            process.exit(1);
+        }, 5000);
 
         try {
-            await bot.stopPolling({ cancel: true }); // Request cancellation of pending updates
+            await bot.stopPolling({ cancel: true });
              clearTimeout(stopPollingTimeout);
             log.info("Telegram bot polling stopped.");
         } catch (err) {
              clearTimeout(stopPollingTimeout);
              log.error(`Error stopping bot polling: ${err}`, 'Shutdown');
-             process.exitCode = 1; // Indicate error on exit
+             process.exitCode = 1;
         }
     }
     log.info(`--- API Checker Script Stopping (Owner: ${OWNER_TAG}) ---`);
-    process.exit(process.exitCode || 0); // Exit with stored code or 0
+    // Allow logger time to write final messages
+    await new Promise(resolve => setTimeout(resolve, 100));
+    process.exit(process.exitCode || 0);
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('uncaughtException', (error) => {
+    log.error(`UNCAUGHT EXCEPTION: ${error.stack || error}`);
+    // Consider a more graceful shutdown attempt here too, but exit quickly
+    // as the application state might be corrupt.
+    process.exit(1);
+});
+process.on('unhandledRejection', (reason, promise) => {
+     log.error(`UNHANDLED PROMISE REJECTION: Reason: ${reason.stack || reason}`);
+     // Optionally exit or attempt graceful shutdown
+     // process.exit(1);
+});
