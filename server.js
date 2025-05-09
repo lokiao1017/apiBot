@@ -1,4 +1,5 @@
 // server.js
+const express = require('express');
 const os = require('os');
 const sys = { // Partial sys emulation
     exit: (code) => {
