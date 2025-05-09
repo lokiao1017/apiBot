@@ -1422,7 +1422,7 @@ function htmlEscape(text) { // Renamed to avoid conflict with 'he' module if use
         .replace(/</g, '<')
         .replace(/>/g, '>')
         .replace(/"/g, '"')
-        .replace(/'/g, ''');
+        .replace(/'/g, "'");
 }
 
 
