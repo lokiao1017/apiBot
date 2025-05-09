@@ -1406,7 +1406,7 @@ async function check_account(username, password, date_timestamp, initial_cookies
 
 function htmlEscape(text) {
     if (typeof text !== 'string') return String(text);
-    return text.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, ''');
+    return text.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, "'");
 }
 
 
